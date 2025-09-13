@@ -62,7 +62,7 @@ type chunkInfo struct {
 // chunk metadata, leases, and system resources. It handles network communication,
 // failure detection, and garbage collection for chunks.
 type ChunkServer struct {
-	mu, lmu  sync.RWMutex // mutex for synchronizing access to server state
+	mu       sync.RWMutex // mutex for synchronizing access to server state
 	listener net.Listener // network listener for incoming connections
 
 	rootDir *filesystem.FileSystem     // root directory file system for chunk storage
@@ -72,9 +72,8 @@ type ChunkServer struct {
 	downloadBuffer  *downloadbuffer.DownloadBuffer   // buffer for handling downloads
 	failureDetector *failuredetector.FailureDetector // detector for identifying node failures
 
-	failureDetectionCh chan string                       // channel for failure detection events
-	garbage            utils.Deque[common.ChunkHandle]   // deque of chunks marked for garbage collection
-	chunks             map[common.ChunkHandle]*chunkInfo // map of chunk handles to their metadata
+	garbage utils.Deque[common.ChunkHandle]   // deque of chunks marked for garbage collection
+	chunks  map[common.ChunkHandle]*chunkInfo // map of chunk handles to their metadata
 
 	isDead       bool           // indicates if the server is marked as dead
 	shutdownChan chan os.Signal // channel for handling shutdown signals
@@ -160,19 +159,18 @@ func NewChunkServer(serverAddr common.ServerAddr, masterAddr common.ServerAddr, 
 	}
 
 	cs := &ChunkServer{
-		ServerAddr:         serverAddr,
-		MasterAddr:         masterAddr,
-		MachineInfo:        machineInfo,
-		rootDir:            fs,
-		leases:             utils.Deque[*common.Lease]{},
-		chunks:             make(map[common.ChunkHandle]*chunkInfo),
-		shutdownChan:       make(chan os.Signal),
-		failureDetectionCh: make(chan string),
-		garbage:            utils.Deque[common.ChunkHandle]{},
-		isDead:             false,
-		archiver:           archivemanager.NewArchiver(fs, 2),
-		failureDetector:    failureDetector,
-		downloadBuffer:     dbuffer,
+		ServerAddr:      serverAddr,
+		MasterAddr:      masterAddr,
+		MachineInfo:     machineInfo,
+		rootDir:         fs,
+		leases:          utils.Deque[*common.Lease]{},
+		chunks:          make(map[common.ChunkHandle]*chunkInfo),
+		shutdownChan:    make(chan os.Signal),
+		garbage:         utils.Deque[common.ChunkHandle]{},
+		isDead:          false,
+		archiver:        archivemanager.NewArchiver(fs, 2),
+		failureDetector: failureDetector,
+		downloadBuffer:  dbuffer,
 	}
 
 	rpc := rpc.NewServer()
@@ -457,6 +455,7 @@ func (cs *ChunkServer) heartBeat() error {
 	arg := rpc_struct.HeartBeatArg{
 		Address:     cs.ServerAddr,
 		MachineInfo: cs.MachineInfo,
+		ExtendLease: true,
 	}
 
 	cs.mu.Lock()
@@ -488,11 +487,9 @@ func (cs *ChunkServer) heartBeat() error {
 	go func() {
 		defer wg.Done()
 		if reply.LeaseExtensions != nil {
-			cs.lmu.Lock()
 			utils.ForEach(reply.LeaseExtensions, func(lease *common.Lease) {
 				cs.leases.PushBack(lease)
 			})
-			cs.lmu.Unlock()
 		}
 
 		if reply.Garbage != nil {
@@ -577,7 +574,7 @@ func (cs *ChunkServer) persistMetadata() error {
 //   - Note: Individual deletion errors are logged for debugging.
 func (cs *ChunkServer) garbageCollection() error {
 	log.Info().Msg("::: Doing some garbage collection >>> ")
-	for cs.garbage.Length() > 0 {
+	for range cs.garbage.Length() {
 		handle := cs.garbage.PopFront()
 		err := cs.deleteChunk(handle)
 		if err != nil {
