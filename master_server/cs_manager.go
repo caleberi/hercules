@@ -16,34 +16,45 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type CSManager struct {
-	sync.RWMutex                         // global lock
-	serverMutex, chunkMutex sync.RWMutex // individual locks for server and chunks
-	servers                 map[common.ServerAddr]*chunkServerInfo
-	chunks                  map[common.ChunkHandle]*chunkInfo
-	replicaMigration        []common.ChunkHandle
-	// store server heatbeat chunk and garbage for cross
-	// master to chunkserver house keep & synchronization
-	// servers             map[common.ServerAddr]*chunkServerInfo
-	files                      map[common.Path]*fileInfo
-	handleToPathMapping        map[common.ChunkHandle]common.Path
-	numberOfCreatedChunkHandle common.ChunkHandle
+// ChunkServerManager manages chunk servers, chunks, and file metadata in a distributed file system.
+// It maintains mappings of servers, chunks, and files, and handles synchronization and replica migration.
+// The struct uses multiple locks to ensure thread-safe access to its fields.
+type ChunkServerManager struct {
+	sync.RWMutex                                                      // RWMutex provides a global lock for coordinating access to the ChunkServerManager's fields.
+	serverMutex                sync.RWMutex                           // serverMutex protects concurrent access to the servers map.
+	chunkMutex                 sync.RWMutex                           // chunkMutex protects concurrent access to the chunks map.
+	servers                    map[common.ServerAddr]*chunkServerInfo // servers maps server addresses to their corresponding chunk server information.
+	chunks                     map[common.ChunkHandle]*chunkInfo      // chunks maps chunk handles to their corresponding chunk information.
+	replicaMigration           []common.ChunkHandle                   // replicaMigration stores chunk handles involved in replica migration operations.
+	files                      map[common.Path]*fileInfo              // files maps file paths to their corresponding file information.
+	handleToPathMapping        map[common.ChunkHandle]common.Path     // handleToPathMapping maps chunk handles to their associated file paths.
+	numberOfCreatedChunkHandle common.ChunkHandle                     // numberOfCreatedChunkHandle tracks the total number of chunk handles created.
 }
 
-func NewCSManager() *CSManager {
-	return &CSManager{
-		servers:                    make(map[common.ServerAddr]*chunkServerInfo),
+func NewChunkServerManager() *ChunkServerManager {
+	return &ChunkServerManager{
 		chunkMutex:                 sync.RWMutex{},
 		serverMutex:                sync.RWMutex{},
-		chunks:                     make(map[common.ChunkHandle]*chunkInfo),
 		replicaMigration:           make([]common.ChunkHandle, 0),
+		servers:                    make(map[common.ServerAddr]*chunkServerInfo),
+		chunks:                     make(map[common.ChunkHandle]*chunkInfo),
 		files:                      make(map[common.Path]*fileInfo),
 		handleToPathMapping:        make(map[common.ChunkHandle]common.Path),
 		numberOfCreatedChunkHandle: 0,
 	}
 }
 
-func (csm *CSManager) getReplicas(handle common.ChunkHandle) ([]common.ServerAddr, error) {
+// getReplicas retrieves the list of server addresses hosting replicas for a given chunk handle.
+// It performs a thread-safe read of the chunk information and returns the associated server locations.
+// If the chunk handle does not exist, an error is returned.
+//
+// Parameters:
+//   - handle: The chunk handle identifying the chunk whose replicas are to be retrieved.
+//
+// Returns:
+//   - A slice of server addresses hosting the chunk's replicas.
+//   - An error if the chunk handle is not found in the chunks map.
+func (csm *ChunkServerManager) getReplicas(handle common.ChunkHandle) ([]common.ServerAddr, error) {
 	csm.chunkMutex.RLock()
 	chunkInfo, ok := csm.chunks[handle]
 	csm.chunkMutex.RUnlock()
@@ -55,17 +66,19 @@ func (csm *CSManager) getReplicas(handle common.ChunkHandle) ([]common.ServerAdd
 	return chunkInfo.locations, nil
 }
 
-//	func (csm *CSManager) getGarbages() []common.ChunkHandle {
-//		csm.RLock()
-//		defer csm.RUnlock()
-//		garbageChunks := make([]common.ChunkHandle, 0)
-//		for _, srv := range csm.servers {
-//			garbageChunks = append(garbageChunks, srv.garbages...)
-//		}
-//		return garbageChunks
-//	}
-
-func (csm *CSManager) registerReplicas(handle common.ChunkHandle, addr common.ServerAddr, readLock bool) error {
+// registerReplicas adds a server address to the list of replicas for a given chunk handle.
+// It performs a thread-safe update to the chunk's location list, using either a read lock or a global lock based on the readLock parameter.
+// If the chunk handle does not exist, an error is returned.
+//
+// Parameters:
+//   - handle: The chunk handle identifying the chunk to register a replica for.
+//   - addr: The server address to be added to the chunk's replica locations.
+//   - readLock: If true, uses a read lock (RLock) for accessing the chunks map; otherwise, uses a global write lock.
+//
+// Returns:
+//   - An error if the chunk handle is not found in the chunks map; otherwise, nil.
+func (csm *ChunkServerManager) registerReplicas(
+	handle common.ChunkHandle, addr common.ServerAddr, readLock bool) error {
 	var (
 		chunkInfo *chunkInfo
 		ok        bool
@@ -86,11 +99,19 @@ func (csm *CSManager) registerReplicas(handle common.ChunkHandle, addr common.Se
 	}
 
 	chunkInfo.locations = append(chunkInfo.locations, addr)
-	log.Info().Msgf("Registering replicas for handle=%v\n with location=%v\n data=%#v", handle, chunkInfo.locations, chunkInfo)
+	log.Info().Msgf(
+		"Registering replicas for handle=%v\n with location=%v\n data=%#v",
+		handle, chunkInfo.locations, chunkInfo)
 	return nil
 }
 
-func (csm *CSManager) detectDeadServer() []common.ServerAddr {
+// detectDeadServer identifies servers that are considered dead based on their last heartbeat.
+// A server is deemed dead if its last heartbeat is zero (never set) or if the time since the last heartbeat
+// exceeds the configured ServerHealthCheckTimeout. The function is thread-safe, using a lock on the servers map.
+//
+// Returns:
+//   - A slice of server addresses that are considered dead.
+func (csm *ChunkServerManager) detectDeadServer() []common.ServerAddr {
 	csm.serverMutex.Lock()
 	defer csm.serverMutex.Unlock()
 
@@ -103,23 +124,37 @@ func (csm *CSManager) detectDeadServer() []common.ServerAddr {
 	return deadServers
 }
 
-func (csm *CSManager) removeChunks(handles []common.ChunkHandle, server common.ServerAddr) error {
-
+// removeChunks removes a specified server from the replica locations of the given chunk handles.
+// It updates the chunk's locations by filtering out the specified server and checks if the remaining
+// replicas meet the minimum replication factor. If the number of replicas falls below the minimum,
+// the chunk is added to the replica migration list. If no replicas remain, an error is logged.
+// The function is thread-safe, using locks on the chunks map and individual chunk info.
+//
+// Parameters:
+//   - handles: A slice of chunk handles identifying the chunks to update.
+//   - server: The server address to remove from each chunk's replica locations.
+//
+// Returns:
+//   - An error containing a semicolon-separated list of error messages if any chunks are not found
+//     or if all replicas for a chunk are lost; otherwise, nil.
+func (csm *ChunkServerManager) removeChunks(handles []common.ChunkHandle, server common.ServerAddr) error {
+	csm.chunkMutex.Lock()
+	defer csm.chunkMutex.Unlock()
 	errs := []string{}
 
-	for _, handle := range handles {
-		// we need to lock read the chunk map
-		csm.chunkMutex.Lock()
-		chk, ok := csm.chunks[handle]
-		csm.chunkMutex.Unlock()
-
-		if !ok {
+	utils.ForEach(handles, func(handle common.ChunkHandle) {
+		chk, exist := csm.chunks[handle]
+		if !exist {
 			errs = append(errs, fmt.Sprintf("chunk handle (%v) does not exist", handle))
-			continue
+			return
 		}
 
 		chk.Lock()
-		chk.locations = utils.Filter(chk.locations, func(v common.ServerAddr) bool { return v != server })
+		chk.locations = utils.Filter(
+			chk.locations,
+			func(v common.ServerAddr) bool {
+				return v != server
+			})
 		chk.expire = time.Now()
 		num := len(chk.locations) //  calulate the number of chunk replica if it is less that the
 		// the replication factor which is ususally 3 then we need more server to fulfill this
@@ -133,7 +168,8 @@ func (csm *CSManager) removeChunks(handles []common.ChunkHandle, server common.S
 				errs = append(errs, msg)
 			}
 		}
-	}
+
+	})
 
 	errStr := strings.Join(errs, ";")
 
@@ -143,7 +179,17 @@ func (csm *CSManager) removeChunks(handles []common.ChunkHandle, server common.S
 	return nil
 }
 
-func (csm *CSManager) removeServer(addr common.ServerAddr) ([]common.ChunkHandle, error) {
+// removeServer removes a server from the ChunkServerManager's servers map and returns the chunk handles associated with it.
+// It performs a thread-safe removal of the server and collects all chunk handles that were stored on the server.
+// If the server is not found, an error is returned.
+//
+// Parameters:
+//   - addr: The server address to remove from the servers map.
+//
+// Returns:
+//   - A slice of chunk handles that were associated with the removed server.
+//   - An error if the server address is not found in the servers map; otherwise, nil.
+func (csm *ChunkServerManager) removeServer(addr common.ServerAddr) ([]common.ChunkHandle, error) {
 	csm.serverMutex.Lock()
 	defer csm.serverMutex.Unlock()
 
@@ -161,12 +207,19 @@ func (csm *CSManager) removeServer(addr common.ServerAddr) ([]common.ChunkHandle
 	return handles, nil
 }
 
-func (csm *CSManager) addChunk(addrs []common.ServerAddr, handle common.ChunkHandle) {
+// addChunk adds a chunk handle to the chunk maps of the specified servers.
+// It performs a thread-safe update to each server's chunk map, associating the given chunk handle with the server.
+// If a server is not found in the servers map, a warning is logged, and the operation is skipped for that server.
+//
+// Parameters:
+//   - addrs: A slice of server addresses to associate with the chunk handle.
+//   - handle: The chunk handle to add to each server's chunk map.
+func (csm *ChunkServerManager) addChunk(addrs []common.ServerAddr, handle common.ChunkHandle) {
 	for _, v := range addrs {
 		csm.serverMutex.RLock()
-		sv, ok := csm.servers[v]
+		sv, exists := csm.servers[v]
 		csm.serverMutex.RUnlock()
-		if ok {
+		if exists {
 			sv.Lock()
 			sv.chunks[handle] = true
 			sv.Unlock()
@@ -176,19 +229,34 @@ func (csm *CSManager) addChunk(addrs []common.ServerAddr, handle common.ChunkHan
 	}
 }
 
-func (csm *CSManager) addGarbage(addr common.ServerAddr, handle common.ChunkHandle) {
+// addGarbage adds a chunk handle to the garbage list of a specified server.
+// It performs a thread-safe update to the server's garbage list, appending the given chunk handle.
+// If the server is not found in the servers map, the operation is silently ignored.
+//
+// Parameters:
+//   - addr: The server address whose garbage list will be updated.
+//   - handle: The chunk handle to add to the server's garbage list.
+func (csm *ChunkServerManager) addGarbage(addr common.ServerAddr, handle common.ChunkHandle) {
 	csm.serverMutex.Lock()
 	defer csm.serverMutex.Unlock()
 
-	sv, ok := csm.servers[addr]
-	if ok {
+	sv, exists := csm.servers[addr]
+	if exists {
 		sv.Lock()
 		sv.garbages = append(sv.garbages, handle)
 		sv.Unlock()
 	}
 }
 
-func (csm *CSManager) getReplicationMigrationList() []common.ChunkHandle {
+// replicationMigration updates and returns the list of chunk handles requiring replica migration.
+// It checks the replica count for each chunk in the replicaMigration list and retains only those
+// with fewer replicas than the MinimumReplicationFactor. The function ensures thread-safety by
+// locking the entire ChunkServerManager. It also removes duplicates from the migration list and
+// sorts the handles for consistency.
+//
+// Returns:
+//   - A slice of chunk handles that need replica migration due to insufficient replicas.
+func (csm *ChunkServerManager) replicationMigration() []common.ChunkHandle {
 	csm.Lock()
 	defer csm.Unlock()
 
@@ -211,7 +279,7 @@ func (csm *CSManager) getReplicationMigrationList() []common.ChunkHandle {
 	return csm.replicaMigration
 }
 
-func (csm *CSManager) extendLease(handle common.ChunkHandle, primary common.ServerAddr) (*chunkInfo, error) {
+func (csm *ChunkServerManager) extendLease(handle common.ChunkHandle, primary common.ServerAddr) (*chunkInfo, error) {
 	csm.chunkMutex.RLock()
 	chk, ok := csm.chunks[handle]
 	csm.chunkMutex.RUnlock()
@@ -229,7 +297,7 @@ func (csm *CSManager) extendLease(handle common.ChunkHandle, primary common.Serv
 
 }
 
-func (csm *CSManager) getLeaseHolder(handle common.ChunkHandle) (*common.Lease, []common.ServerAddr, error) {
+func (csm *ChunkServerManager) getLeaseHolder(handle common.ChunkHandle) (*common.Lease, []common.ServerAddr, error) {
 	csm.chunkMutex.RLock()
 	chk, ok := csm.chunks[handle]
 	csm.chunkMutex.RUnlock()
@@ -324,7 +392,7 @@ func (csm *CSManager) getLeaseHolder(handle common.ChunkHandle) (*common.Lease, 
 	return lease, staleServers, nil
 }
 
-func (csm *CSManager) chooseServers(num int) ([]common.ServerAddr, error) {
+func (csm *ChunkServerManager) chooseServers(num int) ([]common.ServerAddr, error) {
 	type addrToRRTL struct {
 		addr common.ServerAddr
 		rrtl float64
@@ -371,7 +439,7 @@ func (csm *CSManager) chooseServers(num int) ([]common.ServerAddr, error) {
 	return ret, nil
 }
 
-func (csm *CSManager) createChunk(path common.Path, addrs []common.ServerAddr) (common.ChunkHandle, []common.ServerAddr, error) {
+func (csm *ChunkServerManager) createChunk(path common.Path, addrs []common.ServerAddr) (common.ChunkHandle, []common.ServerAddr, error) {
 	csm.Lock()
 	defer csm.Unlock()
 
@@ -430,7 +498,7 @@ func (csm *CSManager) createChunk(path common.Path, addrs []common.ServerAddr) (
 	return currentHandle, servers, nil
 }
 
-func (csm *CSManager) chooseReplicationServer(handle common.ChunkHandle) (from, to common.ServerAddr, err error) {
+func (csm *ChunkServerManager) chooseReplicationServer(handle common.ChunkHandle) (from, to common.ServerAddr, err error) {
 	csm.serverMutex.RLock()
 	defer csm.serverMutex.RUnlock()
 
@@ -451,7 +519,7 @@ func (csm *CSManager) chooseReplicationServer(handle common.ChunkHandle) (from, 
 	return
 }
 
-func (csm *CSManager) SerializeChunks() []serialChunkInfo {
+func (csm *ChunkServerManager) SerializeChunks() []serialChunkInfo {
 	csm.RLock()
 	defer csm.RUnlock()
 
@@ -471,7 +539,7 @@ func (csm *CSManager) SerializeChunks() []serialChunkInfo {
 	return ret
 }
 
-func (csm *CSManager) HeartBeat(addr common.ServerAddr, info common.MachineInfo, reply *rpc_struct.HeartBeatReply) bool {
+func (csm *ChunkServerManager) HeartBeat(addr common.ServerAddr, info common.MachineInfo, reply *rpc_struct.HeartBeatReply) bool {
 	csm.serverMutex.RLock()
 	srv, ok := csm.servers[addr]
 	csm.serverMutex.RUnlock()
@@ -479,7 +547,7 @@ func (csm *CSManager) HeartBeat(addr common.ServerAddr, info common.MachineInfo,
 		log.Info().Msg(fmt.Sprintf("adding new server %v to master", addr))
 		csm.serverMutex.Lock()
 		csm.servers[addr] = &chunkServerInfo{
-			lastHeatBeat: reply.LastHeartBeat,
+			lastHeatBeat: time.Now(),
 			garbages:     make([]common.ChunkHandle, 0),
 			chunks:       make(map[common.ChunkHandle]bool),
 			serverInfo:   info,
@@ -494,11 +562,12 @@ func (csm *CSManager) HeartBeat(addr common.ServerAddr, info common.MachineInfo,
 	copy(reply.Garbage, srv.garbages)
 	srv.garbages = make([]common.ChunkHandle, 0)
 	srv.lastHeatBeat = time.Now()
+	reply.LastHeartBeat = srv.lastHeatBeat
 	srv.Unlock()
 	return false
 }
 
-func (csm *CSManager) DeserializeChunks(chunkInfos []serialChunkInfo) {
+func (csm *ChunkServerManager) DeserializeChunks(chunkInfos []serialChunkInfo) {
 	csm.chunkMutex.Lock()
 	defer csm.chunkMutex.Unlock()
 
@@ -523,7 +592,7 @@ func (csm *CSManager) DeserializeChunks(chunkInfos []serialChunkInfo) {
 	}
 }
 
-func (csm *CSManager) getChunkHandle(filePath common.Path, idx common.ChunkIndex) (common.ChunkHandle, error) {
+func (csm *ChunkServerManager) getChunkHandle(filePath common.Path, idx common.ChunkIndex) (common.ChunkHandle, error) {
 	csm.RLock()
 	defer csm.RUnlock()
 
@@ -538,20 +607,20 @@ func (csm *CSManager) getChunkHandle(filePath common.Path, idx common.ChunkIndex
 	return fileInfo.handles[common.ChunkHandle(idx)], nil
 }
 
-func (csm *CSManager) getChunk(handle common.ChunkHandle) (*chunkInfo, bool) {
+func (csm *ChunkServerManager) getChunk(handle common.ChunkHandle) (*chunkInfo, bool) {
 	csm.chunkMutex.RLock()
 	defer csm.chunkMutex.RUnlock()
 	chk, ok := csm.chunks[handle]
 	return chk, ok
 }
 
-func (csm *CSManager) deleteChunk(handle common.ChunkHandle) {
+func (csm *ChunkServerManager) deleteChunk(handle common.ChunkHandle) {
 	csm.chunkMutex.Lock()
 	defer csm.chunkMutex.Unlock()
 	delete(csm.chunks, handle)
 }
 
-func (csm *CSManager) GetChunkHandles(filePath common.Path) ([]common.ChunkHandle, error) {
+func (csm *ChunkServerManager) GetChunkHandles(filePath common.Path) ([]common.ChunkHandle, error) {
 	csm.RLock()
 	defer csm.RUnlock()
 
@@ -565,7 +634,7 @@ func (csm *CSManager) GetChunkHandles(filePath common.Path) ([]common.ChunkHandl
 	return ret, nil
 }
 
-func (csm *CSManager) UpdateFilePath(source common.Path, target common.Path) error {
+func (csm *ChunkServerManager) UpdateFilePath(source common.Path, target common.Path) error {
 	csm.chunkMutex.Lock()
 	defer csm.chunkMutex.Unlock()
 
