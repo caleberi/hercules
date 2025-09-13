@@ -1,12 +1,5 @@
 package main
 
-import (
-	"time"
-
-	"github.com/caleberi/distributed-system/client"
-	"github.com/caleberi/distributed-system/common"
-)
-
 var data string = `### Captain America: The Winter Soldier - A Modern Marvel Masterpiece
 **"Captain America: The Winter Soldier"** is a pivotal film in the Marvel Cinematic Universe (MCU), 
 blending high-octane action, espionage, and character-driven storytelling to deliver a superhero movie that transcends the genre.
@@ -42,9 +35,9 @@ loyalty, and sacrifice. Its successful blend of action, intrigue, and character 
 superhero films can achieve when they aspire to be more than just spectacle.`
 
 func main() {
-	addr := "127.0.0.1:9090"
-	client := client.NewClient(common.ServerAddr(addr), 30*time.Millisecond)
-	defer client.Close()
+	// addr := "127.0.0.1:9090"
+	// client := client.NewClient(common.ServerAddr(addr), 30*time.Millisecond)
+	// defer client.Close()
 	// handle, err := client.GetChunkHandle("/image/ice-79", common.ChunkIndex(0))
 	// if err != nil {
 	// 	log.Err(err).Stack().Msg(err.Error())
