@@ -125,10 +125,10 @@ func TestGraph(t *testing.T) {
 				assert.NotNil(t, graph)
 				err := graph.Save(4*vg.Inch, 4*vg.Inch, "points.png")
 				assert.NoError(t, err)
-				// _, err = os.Stat("points.png")
-				// assert.NoError(t, err)
-				// err = os.Remove("points.png")
-				// assert.NoError(t, err)
+				_, err = os.Stat("points.png")
+				assert.NoError(t, err)
+				err = os.Remove("points.png")
+				assert.NoError(t, err)
 			},
 		},
 	}
