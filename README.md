@@ -1,3 +1,5 @@
+<img width="100" height="100" alt="ChatGPT Image Sep 15, 2025, 10_01_42 PM" src="https://github.com/user-attachments/assets/a963fa76-7fbd-4290-ab63-4cb19442c5c8" />
+
 # Hercules
 
 > An attempt to reproduce **Google File System (GFS, 2002)**
@@ -144,3 +146,4 @@ This project is released under MIT.
 
 * Inspired by *The Google File System* (2003) by Sanjay Ghemawat, Howard Gobioff, and Shun-Tak Leung
 * Thanks to all contributors
+
