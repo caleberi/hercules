@@ -77,6 +77,7 @@ type ChunkServer struct {
 
 	isDead       bool           // indicates if the server is marked as dead
 	shutdownChan chan os.Signal // channel for handling shutdown signals
+	testMode     bool
 
 	ServerAddr  common.ServerAddr  // address of this server
 	MasterAddr  common.ServerAddr  // address of the master server
@@ -159,17 +160,17 @@ func NewChunkServer(serverAddr common.ServerAddr, masterAddr common.ServerAddr, 
 	}
 
 	cs := &ChunkServer{
+		rootDir:         fs,
 		ServerAddr:      serverAddr,
 		MasterAddr:      masterAddr,
 		MachineInfo:     machineInfo,
-		rootDir:         fs,
+		shutdownChan:    make(chan os.Signal),
 		leases:          utils.Deque[*common.Lease]{},
 		chunks:          make(map[common.ChunkHandle]*chunkInfo),
-		shutdownChan:    make(chan os.Signal),
 		garbage:         utils.Deque[common.ChunkHandle]{},
-		isDead:          false,
 		archiver:        archivemanager.NewArchiver(fs, 2),
 		failureDetector: failureDetector,
+		isDead:          false,
 		downloadBuffer:  dbuffer,
 	}
 
@@ -458,15 +459,12 @@ func (cs *ChunkServer) heartBeat() error {
 		ExtendLease: true,
 	}
 
-	cs.mu.Lock()
 	if cs.leases.Length() != 0 {
 		arg.ExtendLease = true
 	}
-	cs.mu.Unlock()
 
 	var reply rpc_struct.HeartBeatReply
 	reply.NetworkData = failuredetector.NetworkData{
-		RoundTrip: 0,
 		ForwardTrip: failuredetector.TripInfo{
 			SentAt: time.Now(),
 		},
@@ -482,24 +480,17 @@ func (cs *ChunkServer) heartBeat() error {
 		return err
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if reply.LeaseExtensions != nil {
-			utils.ForEach(reply.LeaseExtensions, func(lease *common.Lease) {
-				cs.leases.PushBack(lease)
-			})
-		}
+	if reply.LeaseExtensions != nil {
+		utils.ForEach(reply.LeaseExtensions, func(lease *common.Lease) {
+			cs.leases.PushBack(lease)
+		})
+	}
 
-		if reply.Garbage != nil {
-			utils.ForEach(reply.Garbage, func(handle common.ChunkHandle) {
-				cs.garbage.PushBack(handle)
-			})
-		}
-	}()
-
-	wg.Wait()
+	if reply.Garbage != nil {
+		utils.ForEach(reply.Garbage, func(handle common.ChunkHandle) {
+			cs.garbage.PushBack(handle)
+		})
+	}
 	prediction, err := cs.failureDetector.PredictFailure()
 	if err != nil {
 		log.Err(err).Stack().Send()
@@ -614,6 +605,10 @@ func (cs *ChunkServer) deleteChunk(handle common.ChunkHandle) error {
 	}
 	delete(cs.chunks, handle)
 	cs.mu.Unlock()
+
+	if cs.testMode {
+		return cs.persistMetadata()
+	}
 
 	filename := fmt.Sprintf(common.ChunkFileNameFormat, handle)
 	if chunkInfo.isCompressed {
@@ -818,7 +813,7 @@ func (cs *ChunkServer) RPCCheckChunkVersionHandler(
 		cs.ServerAddr, args.Handle, chinfo.version, args.Version)
 	chinfo.abandoned = true
 	chinfo.lastModified = time.Now()
-	reply.Stale = false
+	reply.Stale = true
 	return nil
 }
 
