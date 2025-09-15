@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/caleberi/distributed-system/common"
 	"github.com/caleberi/distributed-system/master_server"
@@ -39,16 +40,59 @@ func setupMasterServer(
 	return server
 }
 
+func generateRandomChunks() *chunkInfo {
+	rand.New(rand.NewSource(time.Now().UnixNano()))
+	chunk := &chunkInfo{
+		length:       common.Offset(rand.Int63n(1_000_000_000)),
+		checksum:     common.Checksum("test"),
+		version:      common.ChunkVersion(rand.Intn(100) + 1),
+		completed:    rand.Float32() < 0.7,
+		abandoned:    rand.Float32() < 0.2,
+		isCompressed: false,
+		replication:  rand.Intn(4) + 1,
+		serverStatus: rand.Intn(4),
+		creationTime: time.Now().Add(-time.Hour * 24 * time.Duration(rand.Intn(30))),
+		lastModified: time.Now().Add(-time.Hour * 24 * time.Duration(rand.Intn(7))),
+		accessTime:   time.Now().Add(-time.Hour * 24 * time.Duration(rand.Intn(7))),
+		mutations:    make(map[common.ChunkVersion]common.Mutation),
+	}
+
+	numMutations := rand.Intn(6)
+	for range numMutations {
+		mutationVersion := common.ChunkVersion(rand.Intn(100) + 1)
+		chunk.mutations[mutationVersion] = common.Mutation{}
+	}
+
+	if chunk.lastModified.Before(chunk.creationTime) {
+		chunk.lastModified = chunk.creationTime.Add(time.Hour * time.Duration(rand.Intn(24)))
+	}
+	if chunk.accessTime.Before(chunk.creationTime) {
+		chunk.accessTime = chunk.creationTime.Add(time.Hour * time.Duration(rand.Intn(24)))
+	}
+
+	return chunk
+}
+
 func TestRPCHandler(t *testing.T) {
+
 	master := setupMasterServer(
 		t, context.Background(),
 		t.TempDir(), "127.0.0.1:9090")
 	slaves := []*ChunkServer{}
+	handles := []common.ChunkHandle{}
+	chunks := make(map[common.ChunkHandle]*chunkInfo)
 	for range 4 {
 		slave := setupChunkServer(
 			t, t.TempDir(),
 			fmt.Sprintf("127.0.0.1:%d", 8000+rand.Intn(1000)), "127.0.0.1:9090")
+		slave.testMode = true
 		slaves = append(slaves, slave)
+		for range 100 {
+			handle := common.ChunkHandle(rand.Intn(1000))
+			chunks[handle] = generateRandomChunks()
+			handles = append(handles, handle)
+		}
+		slave.chunks = chunks
 	}
 
 	defer func(t *testing.T) {
@@ -95,9 +139,27 @@ func TestRPCHandler(t *testing.T) {
 					rpc_struct.CRPCSysReportHandler,
 					rpc_struct.SysReportInfoArg{}, reply)
 				assert.NoError(t, err)
-				assert.Empty(t, reply.Chunks)
+				assert.NotEmpty(t, reply.Chunks)
 				assert.NotEmpty(t, reply.SysMem)
 				assert.NotZero(t, reply.SysMem.TotalAlloc)
+			},
+		},
+		{
+			Handler: rpc_struct.CRPCCheckChunkVersionHandler,
+			DoTest: func(t *testing.T) {
+				slave := slaves[rand.Intn(len(slaves))]
+				reply := &rpc_struct.CheckChunkVersionReply{}
+				err := shared.UnicastToRPCServer(
+					string(slave.ServerAddr),
+					rpc_struct.CRPCCheckChunkVersionHandler,
+					rpc_struct.CheckChunkVersionArg{
+						Handle:  handles[0],
+						Version: chunks[handles[0]].version,
+					}, reply)
+				assert.NoError(t, err)
+				assert.True(t, reply.Stale)
+				assert.True(t, chunks[handles[0]].abandoned)
+
 			},
 		},
 	}
