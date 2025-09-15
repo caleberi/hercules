@@ -149,16 +149,50 @@ func TestRPCHandler(t *testing.T) {
 			DoTest: func(t *testing.T) {
 				slave := slaves[rand.Intn(len(slaves))]
 				reply := &rpc_struct.CheckChunkVersionReply{}
-				err := shared.UnicastToRPCServer(
-					string(slave.ServerAddr),
-					rpc_struct.CRPCCheckChunkVersionHandler,
-					rpc_struct.CheckChunkVersionArg{
-						Handle:  handles[0],
-						Version: chunks[handles[0]].version,
-					}, reply)
-				assert.NoError(t, err)
-				assert.True(t, reply.Stale)
-				assert.True(t, chunks[handles[0]].abandoned)
+				subTestcases := []struct {
+					name              string
+					shouldBumpVersion bool
+					handle            common.ChunkHandle
+				}{
+					{
+						name:              "VersionBump",
+						shouldBumpVersion: true,
+						handle:            handles[0],
+					},
+					{
+						name:              "NoVersionBump",
+						shouldBumpVersion: false,
+						handle:            handles[0],
+					},
+				}
+				for _, subTestcase := range subTestcases {
+					args := rpc_struct.CheckChunkVersionArg{
+						Handle: handles[0],
+					}
+					if subTestcase.shouldBumpVersion {
+						args.Version = chunks[handles[0]].version + 1
+					}
+					if !subTestcase.shouldBumpVersion {
+						args.Version = chunks[handles[0]].version
+					}
+					t.Run(t.Name()+"_"+subTestcase.name, func(t *testing.T) {
+
+						err := shared.UnicastToRPCServer(
+							string(slave.ServerAddr),
+							rpc_struct.CRPCCheckChunkVersionHandler,
+							args, reply)
+						assert.NoError(t, err)
+						if subTestcase.shouldBumpVersion {
+							assert.False(t, reply.Stale)
+							assert.False(t, chunks[handles[0]].abandoned)
+						}
+						if !subTestcase.shouldBumpVersion {
+							assert.True(t, reply.Stale)
+							assert.True(t, chunks[handles[0]].abandoned)
+						}
+
+					})
+				}
 
 			},
 		},
