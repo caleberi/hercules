@@ -446,9 +446,8 @@ func (csm *ChunkServerManager) createChunk(path common.Path, addrs []common.Serv
 	currentHandle := csm.numberOfCreatedChunkHandle
 	csm.numberOfCreatedChunkHandle++
 
-	file, ok := csm.files[path]
-
-	if !ok {
+	file, exist := csm.files[path]
+	if !exist {
 		csm.files[path] = &fileInfo{
 			handles: make([]common.ChunkHandle, 0),
 		}
@@ -478,9 +477,9 @@ func (csm *ChunkServerManager) createChunk(path common.Path, addrs []common.Serv
 		} else {
 			// update this particular chunk information before handing it o
 			chk.Lock()
-			defer chk.Unlock()
 			chk.locations = append(chk.locations, addr)
 			success = append(success, string(addr))
+			chk.Unlock()
 			log.Info().Msg(fmt.Sprintf("chk location updated after creation locations => %v", chk.locations))
 		}
 	})
@@ -540,30 +539,31 @@ func (csm *ChunkServerManager) SerializeChunks() []serialChunkInfo {
 }
 
 func (csm *ChunkServerManager) HeartBeat(addr common.ServerAddr, info common.MachineInfo, reply *rpc_struct.HeartBeatReply) bool {
-	csm.serverMutex.RLock()
+	csm.serverMutex.Lock()
+	defer csm.serverMutex.Unlock()
 	srv, ok := csm.servers[addr]
-	csm.serverMutex.RUnlock()
 	if !ok {
 		log.Info().Msg(fmt.Sprintf("adding new server %v to master", addr))
-		csm.serverMutex.Lock()
 		csm.servers[addr] = &chunkServerInfo{
 			lastHeatBeat: time.Now(),
 			garbages:     make([]common.ChunkHandle, 0),
 			chunks:       make(map[common.ChunkHandle]bool),
 			serverInfo:   info,
 		}
-		csm.serverMutex.Unlock()
 		return true
 	}
+
 	srv.Lock()
+	defer srv.Unlock()
 	if reply.Garbage == nil {
 		reply.Garbage = make([]common.ChunkHandle, 0)
 	}
 	copy(reply.Garbage, srv.garbages)
+
 	srv.garbages = make([]common.ChunkHandle, 0)
 	srv.lastHeatBeat = time.Now()
 	reply.LastHeartBeat = srv.lastHeatBeat
-	srv.Unlock()
+
 	return false
 }
 

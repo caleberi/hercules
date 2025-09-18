@@ -286,10 +286,13 @@ func (ma *MasterServer) loadMetadata() error {
 }
 
 func (ma *MasterServer) Shutdown() {
+	ma.Lock()
 	if ma.isDead {
+		ma.Unlock()
 		log.Printf("Server [%s] is dead\n", ma.ServerAddr)
 		return
 	}
+	ma.Unlock()
 
 	if err := ma.listener.Close(); err != nil {
 		log.Err(err).Stack().Send()
