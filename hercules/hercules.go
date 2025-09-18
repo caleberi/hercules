@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"strings"
 	"sync"
@@ -542,126 +543,151 @@ func (hercules *HerculesClient) WriteChunk(handle common.ChunkHandle, offset com
 	return writeReply.Length, err
 }
 
-// func (c *Client) Append(path common.Path, data []byte) (offset common.Offset, err error) {
-// 	if len(data) > common.AppendMaxSizeInByte {
-// 		return 0, fmt.Errorf("len of data [%v] > max append size [%v]", len(data), common.AppendMaxSizeInByte)
-// 	}
+// Append appends the given data to the end of the file at the specified path.
+// It retrieves the current file information to determine the starting chunk for
+// the append operation. Data is appended to the last existing chunk or new chunks
+// as needed. If the data exceeds the maximum append size, an error is returned.
+// The function handles chunk boundaries by continuing to the next chunk if the
+// current one would exceed its size limit.
+//
+// Parameters:
+//   - path: The path of the file to append to.
+//   - data: The byte slice containing the data to append.
+//
+// Returns:
+//   - offset: The absolute offset in the file where the appended data starts.
+//   - err: An error if the operation fails, such as invalid data size, RPC errors,
+//     or chunk append failures.
+func (hercules *HerculesClient) Append(path common.Path, data []byte) (offset common.Offset, err error) {
+	if len(data) > common.AppendMaxSizeInByte {
+		return 0, fmt.Errorf("len of data [%v] > max append size [%v]", len(data), common.AppendMaxSizeInByte)
+	}
 
-// 	var (
-// 		args  rpc_struct.GetFileInfoArgs
-// 		reply rpc_struct.GetFileInfoReply
-// 	)
-// 	args.Path = path
-// 	err = shared.UnicastToRPCServer(string(c.masterServer), "MasterServer.RPCGetFileInfoHandler", args, &reply)
-// 	if err != nil {
-// 		log.Err(err).Stack().Msg(err.Error())
-// 		return
-// 	}
+	args := rpc_struct.GetFileInfoArgs{Path: path}
+	reply := rpc_struct.GetFileInfoReply{}
 
-// 	// use the last chunk we created on the master server since
-// 	// we are doing an appended mutation
-// 	start := common.ChunkIndex(math.Max(float64(reply.Chunks-1), 0.0))
-// 	var (
-// 		handle      common.ChunkHandle
-// 		chunkOffset common.Offset
-// 	)
+	args.Path = path
+	err = shared.UnicastToRPCServer(string(hercules.master), rpc_struct.MRPCGetFileInfoHandler, args, &reply)
+	if err != nil {
+		return -1, err
+	}
 
-// 	totalWritten := 0
-// 	for totalWritten < len(data) {
-// 		handle, err = c.GetChunkHandle(args.Path, common.ChunkIndex(start))
-// 		if err != nil {
-// 			log.Err(err).Stack().Msg(err.Error())
-// 			return
-// 		}
+	// use the last chunk we created on the master server since
+	// we are doing an appended mutation
+	start := common.ChunkIndex(math.Max(float64(reply.Chunks-1), 0.0))
+	var (
+		handle      common.ChunkHandle
+		chunkOffset common.Offset
+	)
 
-// 		chunkOffset, err = c.AppendChunk(handle, data)
-// 		if err != nil {
-// 			log.Err(err).Stack().Msg(err.Error())
-// 			if err.(common.Error).Code == common.AppendExceedChunkSize {
-// 				continue
-// 			}
-// 			break
-// 		}
+	totalWritten := 0
+	for totalWritten < len(data) {
+		handle, err = hercules.GetChunkHandle(args.Path, common.ChunkIndex(start))
+		if err != nil {
+			return -1, err
+		}
 
-// 		totalWritten += int(chunkOffset)
-// 		start++
-// 		log.Info().Msg("padding more on next chunk")
-// 	}
-// 	offset = common.Offset(start)*common.ChunkMaxSizeInByte + chunkOffset
-// 	return
-// }
+		chunkOffset, err = hercules.AppendChunk(handle, data)
+		if err != nil {
+			if err.(common.Error).Code == common.AppendExceedChunkSize {
+				continue
+			}
+			break
+		}
 
-// func (c *Client) AppendChunk(handle common.ChunkHandle, data []byte) (common.Offset, error) {
-// 	var offset common.Offset
+		totalWritten += int(chunkOffset)
+		start++
+	}
+	offset = common.Offset(start)*common.ChunkMaxSizeInByte + chunkOffset
+	return
+}
 
-// 	if len(data) > common.AppendMaxSizeInByte {
-// 		return offset, common.Error{
-// 			Code: common.UnknownError,
-// 			Err:  fmt.Sprintf("len(data)[%v]  > max append size (%v)", len(data), common.AppendExceedChunkSize),
-// 		}
-// 	}
+// AppendChunk appends the given data to the specified chunk handle.
+// It first obtains an append lease for the chunk to ensure coordinated access.
+// The data is forwarded to all replicas (including the primary) for consistency.
+// If the append would exceed the chunk's maximum size, it returns a specific error
+// code indicating this condition, allowing the caller to proceed to the next chunk.
+// The function assumes the data length does not exceed the maximum append size,
+// which should be validated by the caller.
+//
+// Parameters:
+//   - handle: The chunk handle identifying the chunk to append to.
+//   - data: The byte slice containing the data to append.
+//
+// Returns:
+//   - offset: The offset within the chunk where the data was appended.
+//   - err: An error if the operation fails, such as lease acquisition failure,
+//     replication errors, or exceeding chunk size (with code common.AppendExceedChunkSize).
+func (hercules *HerculesClient) AppendChunk(handle common.ChunkHandle, data []byte) (common.Offset, error) {
+	var offset common.Offset
 
-// 	appendLease, offset, err := c.getLease(handle, 0)
-// 	if err != nil {
-// 		return offset, err
-// 	}
+	if len(data) > common.AppendMaxSizeInByte {
+		return offset, common.Error{
+			Code: common.UnknownError,
+			Err:  fmt.Sprintf("len(data)[%v]  > max append size (%v)", len(data), common.AppendExceedChunkSize),
+		}
+	}
 
-// 	servers := append(appendLease.Secondaries, appendLease.Primary)
-// 	copy(utils.Filter(servers, func(v common.ServerAddr) bool { return string(v) != "" }), servers)
-// 	if len(servers) == 0 {
-// 		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
-// 	}
+	appendLease, offset, err := hercules.ObtainLease(handle, 0)
+	if err != nil {
+		return offset, err
+	}
 
-// 	if appendLease.Primary == "" {
-// 		appendLease.Primary = servers[0]
-// 		appendLease.Secondaries = servers[1:]
-// 	}
-// 	if len(servers) == 0 {
-// 		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
-// 	}
+	servers := append(appendLease.Secondaries, appendLease.Primary)
+	copy(utils.Filter(servers, func(v common.ServerAddr) bool { return string(v) != "" }), servers)
+	if len(servers) == 0 {
+		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
+	}
 
-// 	dataID := downloadbuffer.NewDownloadBufferId(handle)
-// 	var errs []string
-// 	log.Info().Msgf("RPCForwardDataHandler = %v", servers)
-// 	utils.ForEach(servers, func(addr common.ServerAddr) {
-// 		var d rpc_struct.ForwardDataReply
-// 		if addr != "" {
-// 			replicas := utils.Filter(servers, func(v common.ServerAddr) bool { return v != addr })
-// 			err = shared.UnicastToRPCServer(string(addr),
-// 				rpc_struct.CRPCForwardDataHandler,
-// 				rpc_struct.ForwardDataArgs{
-// 					DownloadBufferId: dataID,
-// 					Data:             data,
-// 					Replicas:         replicas,
-// 				}, &d)
-// 			if err != nil {
-// 				errs = append(errs, err.Error())
-// 			}
-// 		}
-// 	})
-// 	if len(errs) != 0 {
-// 		errStr := strings.Join(errs, ";")
-// 		log.Err(errors.New(errStr)).Stack()
-// 	}
+	if appendLease.Primary == "" {
+		appendLease.Primary = servers[0]
+		appendLease.Secondaries = servers[1:]
+	}
+	if len(servers) == 0 {
+		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
+	}
 
-// 	var (
-// 		appendArgs  rpc_struct.AppendChunkArgs
-// 		appendReply rpc_struct.AppendChunkReply
-// 	)
-// 	appendArgs.DownloadBufferId = dataID
-// 	appendArgs.Replicas = appendLease.Secondaries
-// 	err = shared.UnicastToRPCServer(
-// 		string(appendLease.Primary),
-// 		rpc_struct.CRPCAppendChunkHandler,
-// 		appendArgs, &appendReply)
-// 	if err != nil {
-// 		return -1, common.Error{Code: common.UnknownError, Err: err.Error()}
-// 	}
-// 	if appendReply.ErrorCode == common.AppendExceedChunkSize {
-// 		return appendReply.Offset, common.Error{
-// 			Code: common.UnknownError,
-// 			Err:  "exceed append chunk size",
-// 		}
-// 	}
-// 	return appendReply.Offset, nil
-// }
+	var errs []error
+	dataID := downloadbuffer.NewDownloadBufferId(handle)
+	utils.ForEach(servers, func(addr common.ServerAddr) {
+		var d rpc_struct.ForwardDataReply
+		if addr != "" {
+			replicas := utils.Filter(servers,
+				func(v common.ServerAddr) bool { return v != addr })
+			err = shared.UnicastToRPCServer(string(addr),
+				rpc_struct.CRPCForwardDataHandler,
+				rpc_struct.ForwardDataArgs{
+					DownloadBufferId: dataID,
+					Data:             data,
+					Replicas:         replicas,
+				}, &d)
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+	})
+	if len(errs) != 0 {
+		return offset, errors.Join(errs...)
+	}
+
+	var (
+		appendArgs  rpc_struct.AppendChunkArgs
+		appendReply rpc_struct.AppendChunkReply
+	)
+	appendArgs.DownloadBufferId = dataID
+	appendArgs.Replicas = appendLease.Secondaries
+	err = shared.UnicastToRPCServer(
+		string(appendLease.Primary),
+		rpc_struct.CRPCAppendChunkHandler,
+		appendArgs, &appendReply)
+	if err != nil {
+		return -1, common.Error{Code: common.UnknownError, Err: err.Error()}
+	}
+	if appendReply.ErrorCode == common.AppendExceedChunkSize {
+		return appendReply.Offset, common.Error{
+			Code: common.UnknownError,
+			Err:  "exceed append chunk size",
+		}
+	}
+	return appendReply.Offset, nil
+}

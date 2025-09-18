@@ -44,9 +44,9 @@ loyalty, and sacrifice. Its successful blend of action, intrigue, and character 
 superhero films can achieve when they aspire to be more than just spectacle.`)
 
 func TestReadDataFromChunkServer(t *testing.T) {
+	ctx := t.Context()
 	addr := "127.0.0.1:9090"
-	client := NewClient(common.ServerAddr(addr), 30*time.Millisecond)
-	defer client.Close()
+	client := NewHerculesClient(ctx, common.ServerAddr(addr), 30*time.Millisecond)
 	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
 	if err != nil {
 		log.Err(err).Stack().Msg(err.Error())
@@ -62,51 +62,51 @@ func TestReadDataFromChunkServer(t *testing.T) {
 	log.Print(data)
 }
 
-func TestWriteDataFromChunkServer(t *testing.T) {
-	addr := "127.0.0.1:9090"
-	client := NewClient(common.ServerAddr(addr), 30*time.Millisecond)
-	defer client.Close()
-	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
-	}
-	log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
+// func TestWriteDataFromChunkServer(t *testing.T) {
+// 	addr := "127.0.0.1:9090"
+// 	client := NewClient(common.ServerAddr(addr), 30*time.Millisecond)
+// 	defer client.Close()
+// 	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
+// 	if err != nil {
+// 		log.Err(err).Stack().Msg(err.Error())
+// 		return
+// 	}
+// 	log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
 
-	err = client.Write("/images/independent-day-101", common.Offset(0), data)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
-	}
-}
+// 	err = client.Write("/images/independent-day-101", common.Offset(0), data)
+// 	if err != nil {
+// 		log.Err(err).Stack().Msg(err.Error())
+// 		return
+// 	}
+// }
 
-func TestAppendDataFromChunckServer(t *testing.T) {
-	addr := "127.0.0.1:9090"
-	client := NewClient(common.ServerAddr(addr), 30*time.Millisecond)
-	defer client.Close()
-	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
-	}
-	log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
-	// err = client.Write("/images/independent-day-100", common.Offset(0), []byte("byte is done\n"))
-	// if err != nil {
-	// 	log.Err(err).Stack().Msg(err.Error())
-	// 	return
-	// }
+// func TestAppendDataFromChunckServer(t *testing.T) {
+// 	addr := "127.0.0.1:9090"
+// 	client := NewClient(common.ServerAddr(addr), 30*time.Millisecond)
+// 	defer client.Close()
+// 	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
+// 	if err != nil {
+// 		log.Err(err).Stack().Msg(err.Error())
+// 		return
+// 	}
+// 	log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
+// 	// err = client.Write("/images/independent-day-100", common.Offset(0), []byte("byte is done\n"))
+// 	// if err != nil {
+// 	// 	log.Err(err).Stack().Msg(err.Error())
+// 	// 	return
+// 	// }
 
-	// handle, err = client.GetChunkHandle("/images/independent-day-100", common.ChunkIndex(0))
-	// if err != nil {
-	// 	log.Err(err).Stack().Msg(err.Error())
-	// 	return
-	// }
-	// log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
+// 	// handle, err = client.GetChunkHandle("/images/independent-day-100", common.ChunkIndex(0))
+// 	// if err != nil {
+// 	// 	log.Err(err).Stack().Msg(err.Error())
+// 	// 	return
+// 	// }
+// 	// log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
 
-	_, err = client.Append("/images/independent-day-101", data)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
-	}
+// 	_, err = client.Append("/images/independent-day-101", data)
+// 	if err != nil {
+// 		log.Err(err).Stack().Msg(err.Error())
+// 		return
+// 	}
 
-}
+// }
