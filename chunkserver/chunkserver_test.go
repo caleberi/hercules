@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/caleberi/distributed-system/common"
+	downloadbuffer "github.com/caleberi/distributed-system/download_buffer"
 	"github.com/caleberi/distributed-system/master_server"
 	"github.com/caleberi/distributed-system/rpc_struct"
 	"github.com/caleberi/distributed-system/shared"
+	"github.com/jaswdr/faker/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -40,67 +43,91 @@ func setupMasterServer(
 	return server
 }
 
-func generateRandomChunks() *chunkInfo {
+func populateServers(t *testing.T, masterAddress common.ServerAddr) []common.ChunkHandle {
 	rand.New(rand.NewSource(time.Now().UnixNano()))
-	chunk := &chunkInfo{
-		length:       common.Offset(rand.Int63n(1_000_000_000)),
-		checksum:     common.Checksum("test"),
-		version:      common.ChunkVersion(rand.Intn(100) + 1),
-		completed:    rand.Float32() < 0.7,
-		abandoned:    rand.Float32() < 0.2,
-		isCompressed: false,
-		replication:  rand.Intn(4) + 1,
-		serverStatus: rand.Intn(4),
-		creationTime: time.Now().Add(-time.Hour * 24 * time.Duration(rand.Intn(30))),
-		lastModified: time.Now().Add(-time.Hour * 24 * time.Duration(rand.Intn(7))),
-		accessTime:   time.Now().Add(-time.Hour * 24 * time.Duration(rand.Intn(7))),
-		mutations:    make(map[common.ChunkVersion]common.Mutation),
-	}
+	chunkHandles := []common.ChunkHandle{}
 
-	numMutations := rand.Intn(6)
-	for range numMutations {
-		mutationVersion := common.ChunkVersion(rand.Intn(100) + 1)
-		chunk.mutations[mutationVersion] = common.Mutation{}
-	}
+	fake := faker.New()
 
-	if chunk.lastModified.Before(chunk.creationTime) {
-		chunk.lastModified = chunk.creationTime.Add(time.Hour * time.Duration(rand.Intn(24)))
-	}
-	if chunk.accessTime.Before(chunk.creationTime) {
-		chunk.accessTime = chunk.creationTime.Add(time.Hour * time.Duration(rand.Intn(24)))
-	}
+	for range 5 {
+		fakePath := fmt.Sprintf(
+			"/%s/%s/file-%d", fake.Music().Name(), fake.Music().Author(), rand.Intn(1000))
+		getChunkHandleReply := &rpc_struct.GetChunkHandleReply{}
+		index := common.ChunkIndex(0)
+		err := shared.UnicastToRPCServer(
+			string(masterAddress),
+			rpc_struct.MRPCGetChunkHandleHandler,
+			rpc_struct.GetChunkHandleArgs{
+				Path:  common.Path(fakePath),
+				Index: index,
+			}, getChunkHandleReply)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, getChunkHandleReply.Handle, common.ChunkHandle(index))
 
-	return chunk
+		primaryAndSecondaryInfoReply := &rpc_struct.PrimaryAndSecondaryServersInfoReply{}
+		err = shared.UnicastToRPCServer(
+			string(masterAddress),
+			rpc_struct.MRPCGetPrimaryAndSecondaryServersInfoHandler,
+			rpc_struct.PrimaryAndSecondaryServersInfoArg{
+				Handle: getChunkHandleReply.Handle,
+			}, primaryAndSecondaryInfoReply)
+		require.NoError(t, err)
+		require.NotEmpty(t, primaryAndSecondaryInfoReply.Primary)
+		require.NotEmpty(t, primaryAndSecondaryInfoReply.SecondaryServers)
+
+		downloadBufferId := downloadbuffer.NewDownloadBufferId(getChunkHandleReply.Handle)
+		forwardDataReply := &rpc_struct.ForwardDataReply{}
+		lorem := strings.Join(faker.Lorem.Paragraphs(fake.Lorem(), 100), "\n")
+		err = shared.UnicastToRPCServer(
+			string(primaryAndSecondaryInfoReply.Primary),
+			rpc_struct.CRPCForwardDataHandler,
+			rpc_struct.ForwardDataArgs{
+				DownloadBufferId: downloadBufferId,
+				Data:             []byte(lorem),
+				Replicas:         primaryAndSecondaryInfoReply.SecondaryServers,
+			}, forwardDataReply)
+		require.NoError(t, err)
+		require.Zero(t, forwardDataReply.ErrorCode)
+
+		time.Sleep(1 * time.Second) // wait for data to be forwarded
+		writeChunkReply := &rpc_struct.WriteChunkReply{}
+		err = shared.UnicastToRPCServer(
+			string(primaryAndSecondaryInfoReply.Primary),
+			rpc_struct.CRPCWriteChunkHandler,
+			rpc_struct.WriteChunkArgs{
+				DownloadBufferId: downloadBufferId,
+				Offset:           common.Offset(0),
+				Replicas:         primaryAndSecondaryInfoReply.SecondaryServers,
+			}, writeChunkReply)
+		require.NoError(t, err)
+		require.Zero(t, writeChunkReply.ErrorCode)
+
+		require.GreaterOrEqual(t, writeChunkReply.Length, 20)
+
+		chunkHandles = append(chunkHandles, getChunkHandleReply.Handle)
+	}
+	return chunkHandles
 }
 
 func TestRPCHandler(t *testing.T) {
-
-	master := setupMasterServer(
-		t, context.Background(),
-		t.TempDir(), "127.0.0.1:9090")
+	dirPath := t.TempDir()
+	master := setupMasterServer(t, context.Background(), dirPath, "127.0.0.1:9090")
 	slaves := []*ChunkServer{}
-	handles := []common.ChunkHandle{}
-	chunks := make(map[common.ChunkHandle]*chunkInfo)
-	for range 4 {
-		slave := setupChunkServer(
-			t, t.TempDir(),
-			fmt.Sprintf("127.0.0.1:%d", 8000+rand.Intn(1000)), "127.0.0.1:9090")
-		slave.testMode = true
+	for i := 0; i < 4; i++ {
+		slave := setupChunkServer(t, t.TempDir(), fmt.Sprintf("127.0.0.1:%d", 8000+rand.Intn(1000)), "127.0.0.1:9090")
 		slaves = append(slaves, slave)
-		for range 100 {
-			handle := common.ChunkHandle(rand.Intn(1000))
-			chunks[handle] = generateRandomChunks()
-			handles = append(handles, handle)
-		}
-		slave.chunks = chunks
 	}
 
 	defer func(t *testing.T) {
-		master.Shutdown()
 		for _, slave := range slaves {
 			assert.NoError(t, slave.Shutdown())
+			time.Sleep(1 * time.Second)
 		}
+		master.Shutdown()
 	}(t)
+
+	time.Sleep(2 * time.Second)
+	handles := populateServers(t, master.ServerAddr)
 
 	type testcase struct {
 		Handler string
@@ -149,51 +176,232 @@ func TestRPCHandler(t *testing.T) {
 			DoTest: func(t *testing.T) {
 				slave := slaves[rand.Intn(len(slaves))]
 				reply := &rpc_struct.CheckChunkVersionReply{}
+
 				subTestcases := []struct {
 					name              string
 					shouldBumpVersion bool
 					handle            common.ChunkHandle
 				}{
 					{
-						name:              "VersionBump",
-						shouldBumpVersion: true,
-						handle:            handles[0],
-					},
-					{
 						name:              "NoVersionBump",
 						shouldBumpVersion: false,
-						handle:            handles[0],
+						handle:            handles[rand.Intn(len(handles))],
 					},
 				}
 				for _, subTestcase := range subTestcases {
 					args := rpc_struct.CheckChunkVersionArg{
-						Handle: handles[0],
-					}
-					if subTestcase.shouldBumpVersion {
-						args.Version = chunks[handles[0]].version + 1
-					}
-					if !subTestcase.shouldBumpVersion {
-						args.Version = chunks[handles[0]].version
+						Handle: subTestcase.handle,
 					}
 					t.Run(t.Name()+"_"+subTestcase.name, func(t *testing.T) {
-
 						err := shared.UnicastToRPCServer(
 							string(slave.ServerAddr),
 							rpc_struct.CRPCCheckChunkVersionHandler,
 							args, reply)
 						assert.NoError(t, err)
-						if subTestcase.shouldBumpVersion {
-							assert.False(t, reply.Stale)
-							assert.False(t, chunks[handles[0]].abandoned)
-						}
 						if !subTestcase.shouldBumpVersion {
 							assert.True(t, reply.Stale)
-							assert.True(t, chunks[handles[0]].abandoned)
 						}
 
 					})
 				}
 
+			},
+		},
+		{
+			Handler: rpc_struct.CRPCReadChunkHandler,
+			DoTest: func(t *testing.T) {
+				slave := slaves[rand.Intn(len(slaves))]
+				handle := handles[rand.Intn(len(handles))]
+
+				reply := &rpc_struct.ReadChunkReply{}
+				err := shared.UnicastToRPCServer(
+					string(slave.ServerAddr),
+					rpc_struct.CRPCReadChunkHandler,
+					rpc_struct.ReadChunkArgs{
+						Handle: handle,
+						Offset: 0,
+						Length: int64(20),
+					}, reply)
+
+				assert.NoError(t, err)
+				assert.NotEmpty(t, reply.Data)
+				assert.Equal(t, 20, len(reply.Data))
+			},
+		},
+		{
+			Handler: rpc_struct.CRPCWriteChunkHandler,
+			DoTest: func(t *testing.T) {
+				fake := faker.New()
+				fakePath := fmt.Sprintf("/%s/%s/file-%d", fake.Music().Name(), fake.Music().Author(), rand.Intn(1000))
+				getChunkHandleReply := &rpc_struct.GetChunkHandleReply{}
+				index := common.ChunkIndex(0)
+				err := shared.UnicastToRPCServer(
+					string(master.ServerAddr),
+					rpc_struct.MRPCGetChunkHandleHandler,
+					rpc_struct.GetChunkHandleArgs{
+						Path:  common.Path(fakePath),
+						Index: index,
+					}, getChunkHandleReply)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, getChunkHandleReply.Handle, common.ChunkHandle(index))
+
+				primaryAndSecondaryInfoReply := &rpc_struct.PrimaryAndSecondaryServersInfoReply{}
+				err = shared.UnicastToRPCServer(
+					string(master.ServerAddr),
+					rpc_struct.MRPCGetPrimaryAndSecondaryServersInfoHandler,
+					rpc_struct.PrimaryAndSecondaryServersInfoArg{
+						Handle: getChunkHandleReply.Handle,
+					}, primaryAndSecondaryInfoReply)
+				require.NoError(t, err)
+				require.NotEmpty(t, primaryAndSecondaryInfoReply.Primary)
+				require.NotEmpty(t, primaryAndSecondaryInfoReply.SecondaryServers)
+
+				forwardDataReply := &rpc_struct.ForwardDataReply{}
+				downloadBufferId := downloadbuffer.NewDownloadBufferId(getChunkHandleReply.Handle)
+
+				err = shared.UnicastToRPCServer(
+					string(primaryAndSecondaryInfoReply.Primary),
+					rpc_struct.CRPCForwardDataHandler,
+					rpc_struct.ForwardDataArgs{
+						DownloadBufferId: downloadBufferId,
+						Data:             []byte(fake.Lorem().Paragraph(5)),
+						Replicas:         primaryAndSecondaryInfoReply.SecondaryServers,
+					}, forwardDataReply)
+				require.NoError(t, err)
+				require.Zero(t, forwardDataReply.ErrorCode)
+
+				time.Sleep(1 * time.Second) // wait for data to be forwarded
+				subtests := []struct {
+					name    string
+					subtest func(*testing.T)
+				}{
+					{
+						name: rpc_struct.CRPCWriteChunkHandler,
+						subtest: func(t *testing.T) {
+							reply := &rpc_struct.WriteChunkReply{}
+							err := shared.UnicastToRPCServer(
+								string(primaryAndSecondaryInfoReply.Primary),
+								rpc_struct.CRPCWriteChunkHandler,
+								rpc_struct.WriteChunkArgs{
+									DownloadBufferId: downloadBufferId,
+									Offset:           0,
+									Replicas:         primaryAndSecondaryInfoReply.SecondaryServers,
+								}, reply)
+
+							assert.NoError(t, err)
+							assert.Zero(t, reply.ErrorCode)
+							assert.Greater(t, reply.Length, 0)
+						},
+					},
+					{
+						name: rpc_struct.CRPCAppendChunkHandler,
+						subtest: func(t *testing.T) {
+							forwardDataReply := &rpc_struct.ForwardDataReply{}
+							downloadBufferId := downloadbuffer.NewDownloadBufferId(getChunkHandleReply.Handle)
+							contents := fake.Lorem().Sentence(1)
+							err = shared.UnicastToRPCServer(
+								string(primaryAndSecondaryInfoReply.Primary),
+								rpc_struct.CRPCForwardDataHandler,
+								rpc_struct.ForwardDataArgs{
+									DownloadBufferId: downloadBufferId,
+									Data:             []byte(contents),
+									Replicas:         primaryAndSecondaryInfoReply.SecondaryServers,
+								}, forwardDataReply)
+							require.NoError(t, err)
+							require.Zero(t, forwardDataReply.ErrorCode)
+
+							reply := &rpc_struct.AppendChunkReply{}
+							err := shared.UnicastToRPCServer(
+								string(primaryAndSecondaryInfoReply.Primary),
+								rpc_struct.CRPCAppendChunkHandler,
+								rpc_struct.AppendChunkArgs{
+									DownloadBufferId: downloadBufferId,
+									Replicas:         primaryAndSecondaryInfoReply.SecondaryServers,
+								}, reply)
+
+							assert.NoError(t, err)
+							assert.Zero(t, reply.ErrorCode)
+							assert.Greater(t, reply.Offset, common.Offset(0))
+
+							readReply := &rpc_struct.ReadChunkReply{}
+							err = shared.UnicastToRPCServer(
+								string(primaryAndSecondaryInfoReply.Primary),
+								rpc_struct.CRPCReadChunkHandler,
+								rpc_struct.ReadChunkArgs{
+									Handle: getChunkHandleReply.Handle,
+									Offset: common.Offset(0),
+									Length: int64(len(contents)),
+								}, readReply)
+
+							assert.NoError(t, err)
+							assert.Zero(t, readReply.ErrorCode)
+							assert.NotEmpty(t, readReply.Data)
+						},
+					},
+				}
+
+				for _, subtest := range subtests {
+					t.Run(subtest.name, func(t *testing.T) {
+						subtest.subtest(t)
+					})
+				}
+			},
+		},
+		{
+			Handler: rpc_struct.CRPCApplyMutationHandler,
+			DoTest: func(t *testing.T) {
+				fake := faker.New()
+				fakePath := fmt.Sprintf("/%s/%s/file-%d", fake.Music().Name(), fake.Music().Author(), rand.Intn(1000))
+				getChunkHandleReply := &rpc_struct.GetChunkHandleReply{}
+				index := common.ChunkIndex(0)
+				err := shared.UnicastToRPCServer(
+					string(master.ServerAddr),
+					rpc_struct.MRPCGetChunkHandleHandler,
+					rpc_struct.GetChunkHandleArgs{
+						Path:  common.Path(fakePath),
+						Index: index,
+					}, getChunkHandleReply)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, getChunkHandleReply.Handle, common.ChunkHandle(index))
+
+				primaryAndSecondaryInfoReply := &rpc_struct.PrimaryAndSecondaryServersInfoReply{}
+				err = shared.UnicastToRPCServer(
+					string(master.ServerAddr),
+					rpc_struct.MRPCGetPrimaryAndSecondaryServersInfoHandler,
+					rpc_struct.PrimaryAndSecondaryServersInfoArg{
+						Handle: getChunkHandleReply.Handle,
+					}, primaryAndSecondaryInfoReply)
+				require.NoError(t, err)
+				require.NotEmpty(t, primaryAndSecondaryInfoReply.Primary)
+				require.NotEmpty(t, primaryAndSecondaryInfoReply.SecondaryServers)
+
+				forwardDataReply := &rpc_struct.ForwardDataReply{}
+				downloadBufferId := downloadbuffer.NewDownloadBufferId(getChunkHandleReply.Handle)
+
+				err = shared.UnicastToRPCServer(
+					string(primaryAndSecondaryInfoReply.Primary),
+					rpc_struct.CRPCForwardDataHandler,
+					rpc_struct.ForwardDataArgs{
+						DownloadBufferId: downloadBufferId,
+						Data:             []byte(fake.Lorem().Paragraph(5)),
+						Replicas:         primaryAndSecondaryInfoReply.SecondaryServers,
+					}, forwardDataReply)
+				require.NoError(t, err)
+				require.Zero(t, forwardDataReply.ErrorCode)
+
+				reply := &rpc_struct.ApplyMutationReply{}
+				err = shared.UnicastToRPCServer(
+					string(primaryAndSecondaryInfoReply.Primary),
+					rpc_struct.CRPCApplyMutationHandler,
+					rpc_struct.ApplyMutationArgs{
+						MutationType:     common.MutationAppend,
+						Offset:           0,
+						DownloadBufferId: downloadBufferId},
+					reply)
+
+				assert.NoError(t, err)
+				assert.Zero(t, reply.ErrorCode)
+				assert.Greater(t, reply.Length, 0)
 			},
 		},
 	}
@@ -203,4 +411,5 @@ func TestRPCHandler(t *testing.T) {
 			tc.DoTest(t)
 		})
 	}
+
 }
