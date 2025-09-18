@@ -130,6 +130,8 @@ func TestRPCHandler(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	handles := populateServers(t, master.ServerAddr)
 
+	time.Sleep(2 * time.Second)
+
 	type testcase struct {
 		Handler string
 		DoTest  func(t *testing.T)
