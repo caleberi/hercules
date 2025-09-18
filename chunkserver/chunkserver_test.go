@@ -113,15 +113,16 @@ func TestRPCHandler(t *testing.T) {
 	dirPath := t.TempDir()
 	master := setupMasterServer(t, context.Background(), dirPath, "127.0.0.1:9090")
 	slaves := []*ChunkServer{}
-	for i := 0; i < 4; i++ {
-		slave := setupChunkServer(t, t.TempDir(), fmt.Sprintf("127.0.0.1:%d", 8000+rand.Intn(1000)), "127.0.0.1:9090")
+	for range 4 {
+		slave := setupChunkServer(
+			t, t.TempDir(),
+			fmt.Sprintf("127.0.0.1:%d", 10000+rand.Intn(1000)), "127.0.0.1:9090")
 		slaves = append(slaves, slave)
 	}
 
 	defer func(t *testing.T) {
 		for _, slave := range slaves {
 			assert.NoError(t, slave.Shutdown())
-			time.Sleep(1 * time.Second)
 		}
 		master.Shutdown()
 	}(t)
