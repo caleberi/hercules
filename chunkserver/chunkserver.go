@@ -77,7 +77,6 @@ type ChunkServer struct {
 
 	isDead       bool           // indicates if the server is marked as dead
 	shutdownChan chan os.Signal // channel for handling shutdown signals
-	testMode     bool
 
 	ServerAddr  common.ServerAddr  // address of this server
 	MasterAddr  common.ServerAddr  // address of the master server
@@ -246,8 +245,6 @@ func NewChunkServer(serverAddr common.ServerAddr, masterAddr common.ServerAddr, 
 			case <-cs.shutdownChan:
 				log.Info().Msg(fmt.Sprintf("Gracefully shutting down server (%s)...\n", serverAddr))
 				time.Sleep(time.Second * 1)
-				cs.downloadBuffer.Done()
-				cs.archiver.Close()
 				return
 			case <-heartBeatTicker.C:
 				branchInfo.Event = string(common.HeartBeat)
@@ -264,9 +261,8 @@ func NewChunkServer(serverAddr common.ServerAddr, masterAddr common.ServerAddr, 
 			}
 
 			if branchInfo.Err != nil {
-				log.Err(branchInfo.Err).Msgf(
-					fmt.Sprintf("Server %s  background-(%s) event triggered an error (%s)\n",
-						cs.ServerAddr, branchInfo.Event, branchInfo.Err))
+				log.Err(branchInfo.Err).Msgf("Server %s  background-(%s) event triggered an error (%s)\n",
+					cs.ServerAddr, branchInfo.Event, branchInfo.Err)
 			}
 		}
 	}()
@@ -606,10 +602,6 @@ func (cs *ChunkServer) deleteChunk(handle common.ChunkHandle) error {
 	delete(cs.chunks, handle)
 	cs.mu.Unlock()
 
-	if cs.testMode {
-		return cs.persistMetadata()
-	}
-
 	filename := fmt.Sprintf(common.ChunkFileNameFormat, handle)
 	if chunkInfo.isCompressed {
 		filename += archivemanager.ZIP_EXT
@@ -843,7 +835,9 @@ func (cs *ChunkServer) RPCReadChunkHandler(args rpc_struct.ReadChunkArgs, reply 
 	chInfo.RLock()
 	n, err := cs.readChunk(args.Handle, args.Offset, reply.Data)
 	if err != nil {
+		chInfo.RUnlock()
 		log.Err(err).Stack().Send()
+		return err
 	}
 	reply.Length = int64(n)
 	chInfo.RUnlock()
@@ -967,8 +961,8 @@ func (cs *ChunkServer) RPCGrantLeaseHandler(args rpc_struct.GrantLeaseInfoArgs, 
 //     the maximum chunk size, the lease is invalid or expired, or the write operation fails.
 //     Returns nil if the write is successful.
 func (cs *ChunkServer) RPCWriteChunkHandler(args rpc_struct.WriteChunkArgs, reply *rpc_struct.WriteChunkReply) error {
-	data, ok := cs.downloadBuffer.Get(args.DownloadBufferId)
-	if !ok {
+	data, exists := cs.downloadBuffer.Get(args.DownloadBufferId)
+	if !exists {
 		reply.ErrorCode = common.DownloadBufferMiss
 		return fmt.Errorf(
 			"could not locate %v in buffer (might have expired ...)",
@@ -992,10 +986,11 @@ func (cs *ChunkServer) RPCWriteChunkHandler(args rpc_struct.WriteChunkArgs, repl
 		return fmt.Errorf("could not acquire write lease / lease has expired")
 	}
 
-	err = performWrite(cs, args, data)
+	n, err := performWrite(cs, lease.Expire, args, data)
 	if err != nil {
 		return err
 	}
+	reply.Length = n
 
 	if !lease.IsExpired(time.Now()) {
 		cs.leases.PushFront(lease)
@@ -1037,29 +1032,34 @@ func (cs *ChunkServer) RPCApplyMutationHandler(args rpc_struct.ApplyMutationArgs
 	}
 
 	handle := args.DownloadBufferId.Handle
-	err = cs.unarchiveChunks(handle)
-	if err != nil {
-		return err
-	}
+
 	cs.mu.RLock()
 	chInfo, ok := cs.chunks[handle]
-	cs.mu.RUnlock()
+
 	if !ok || chInfo.abandoned {
+		cs.mu.RUnlock()
 		return fmt.Errorf("%v is either abandoned or lives in another dimension", handle)
 	}
 
+	if chInfo.isCompressed {
+		err = cs.unarchiveChunks(handle)
+		if err != nil {
+			cs.mu.RUnlock()
+			return err
+		}
+	}
+	cs.mu.RUnlock()
 	mutation := &common.Mutation{
 		MutationType: args.MutationType,
 		Data:         data,
 		Offset:       args.Offset,
 	}
 
-	chInfo.Lock()
-	defer chInfo.Unlock()
-	err = cs.doMutate(handle, mutation)
+	n, err := cs.doMutate(handle, mutation)
 	if err != nil {
 		return err
 	}
+	reply.Length = n
 
 	return nil
 }
@@ -1125,12 +1125,12 @@ func (cs *ChunkServer) RPCAppendChunkHandler(args rpc_struct.AppendChunkArgs, re
 		Offset:       offset,
 	}
 
-	err = cs.doMutate(handle, mutation)
+	n, err := cs.doMutate(handle, mutation)
 	if err != nil {
 		return err
 	}
 	cs.mu.Lock()
-	chInfo.length = newLength
+	chInfo.length = common.Offset(n)
 	cs.mu.Unlock()
 	applyMutationArgs := rpc_struct.ApplyMutationArgs{
 		DownloadBufferId: args.DownloadBufferId,
@@ -1232,7 +1232,7 @@ func (cs *ChunkServer) RPCApplyCopyHandler(args rpc_struct.ApplyCopyArgs, reply 
 		}
 	}
 
-	err := cs.writeChunk(handle, args.Data, common.MutationWrite, 0, true)
+	n, err := cs.writeChunk(handle, args.Data, common.MutationWrite, 0, true)
 	if err != nil {
 		return err
 	}
@@ -1240,6 +1240,8 @@ func (cs *ChunkServer) RPCApplyCopyHandler(args rpc_struct.ApplyCopyArgs, reply 
 	chInfo.version = args.Version
 	cs.mu.Unlock()
 	log.Info().Msgf("Server %v : Copy handler done", cs.ServerAddr)
+
+	reply.Offset = common.Offset(n)
 	return nil
 }
 
@@ -1260,76 +1262,89 @@ func (cs *ChunkServer) RPCApplyCopyHandler(args rpc_struct.ApplyCopyArgs, reply 
 // Returns:
 //   - error: Returns an aggregated error if the chunk does not exist, is abandoned, completed, or compressed and unarchiving fails,
 //     or if the local or replica mutation operations fail. Returns nil if the write is successful.
-func performWrite(cs *ChunkServer, args rpc_struct.WriteChunkArgs, data []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func performWrite(cs *ChunkServer, deadline time.Time, args rpc_struct.WriteChunkArgs, data []byte) (int, error) {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	log.Info().Msgf("[writing to chunk] %v", cs.ServerAddr)
 
+	cs.mu.Lock()
 	handle := args.DownloadBufferId.Handle
-	cs.mu.RLock()
 	chInfo, ok := cs.chunks[handle]
-	cs.mu.RUnlock()
 	if !ok || chInfo.abandoned {
-		return fmt.Errorf("chunk %v on server %v is abandoned or does not exist", handle, cs.ServerAddr)
+		cs.mu.Unlock()
+		return 0, fmt.Errorf("chunk %v on server %v is abandoned or does not exist", handle, cs.ServerAddr)
 	}
+
+	if chInfo.completed {
+		cs.mu.Unlock()
+		return 0, fmt.Errorf("chunk %v on server %v is completed and cannot be written", handle, cs.ServerAddr)
+	}
+
 	if chInfo.isCompressed {
 		if err := cs.unarchiveChunks(handle); err != nil {
-			return err
+			cs.mu.Unlock()
+			return 0, err
 		}
 	}
-	if chInfo.completed {
-		return fmt.Errorf("chunk %v on server %v is completed and cannot be written", handle, cs.ServerAddr)
-	}
+	cs.mu.Unlock()
+
 	dataSize, err := utils.BToMb(uint64(args.Offset) + uint64(len(data)))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if dataSize > common.ChunkMaxSizeInMb {
-		return fmt.Errorf("data size for chunk %v exceeds max size of %v MB", handle, common.ChunkMaxSizeInMb)
+		return 0, fmt.Errorf("data size for chunk %v exceeds max size of %v MB", handle, common.ChunkMaxSizeInMb)
 	}
 	mutation := &common.Mutation{
 		MutationType: common.MutationWrite,
 		Data:         data,
 		Offset:       args.Offset,
 	}
-	if err := cs.doMutate(handle, mutation); err != nil {
-		return err
+
+	log.Info().Msgf("performing write mutation on chunk %v at offset %v with data size %v bytes", handle, args.Offset, len(data))
+	log.Info().Msgf("data  => %s", string(data))
+	n, err := cs.doMutate(handle, mutation)
+	if err != nil {
+		return 0, err
 	}
 
 	chInfo.Lock()
 	if _, exists := chInfo.mutations[chInfo.version]; exists {
 		chInfo.version++
+	} else {
+		chInfo.mutations[chInfo.version] = *mutation
 	}
-	chInfo.mutations[chInfo.version] = *mutation
 	chInfo.Unlock()
 
 	errCh := make(chan error, len(args.Replicas)+1)
 	var wg sync.WaitGroup
 
 	wg.Add(len(args.Replicas))
-	go func() {
-		utils.ForEach(args.Replicas, func(replicaAddr common.ServerAddr) {
+	for _, server := range args.Replicas {
+		go func(replicaAddr common.ServerAddr) {
 			defer wg.Done()
+
 			select {
 			case <-ctx.Done():
-				errCh <- ctx.Err()
+				errCh <- fmt.Errorf("replica %v: %w", replicaAddr, ctx.Err())
 				return
 			default:
-				var applyMutationReply rpc_struct.ApplyMutationReply
-				err := shared.UnicastToRPCServer(
-					string(replicaAddr),
-					rpc_struct.CRPCApplyMutationHandler,
-					rpc_struct.ApplyMutationArgs{
-						DownloadBufferId: args.DownloadBufferId,
-						MutationType:     common.MutationWrite,
-						Offset:           args.Offset,
-					}, &applyMutationReply)
-				if err != nil {
-					errCh <- err
-				}
 			}
-		})
-	}()
+
+			var applyMutationReply rpc_struct.ApplyMutationReply
+			err := shared.UnicastToRPCServer(
+				string(replicaAddr),
+				rpc_struct.CRPCApplyMutationHandler,
+				rpc_struct.ApplyMutationArgs{
+					DownloadBufferId: args.DownloadBufferId,
+					MutationType:     common.MutationWrite,
+					Offset:           args.Offset,
+				}, &applyMutationReply)
+			if err != nil {
+				errCh <- fmt.Errorf("failed to apply mutation to replica %v: %w", replicaAddr, err)
+			}
+		}(server)
+	}
 
 	go func() {
 		wg.Wait()
@@ -1338,20 +1353,26 @@ func performWrite(cs *ChunkServer, args rpc_struct.WriteChunkArgs, data []byte) 
 
 	var errs []error
 	for e := range errCh {
-		errs = append(errs, e)
+		if e != nil {
+			errs = append(errs, e)
+		}
 	}
 
-	if len(errs) != 0 {
-		return errors.Join(errs...)
+	if len(errs) > 0 {
+		return n, fmt.Errorf("replication errors: %w", errors.Join(errs...))
 	}
 
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	cs.chunks[args.DownloadBufferId.Handle].length += common.Offset(len(data))
-	return nil
+	if chunk, exists := cs.chunks[args.DownloadBufferId.Handle]; exists {
+		chunk.length += common.Offset(len(data))
+	} else {
+		return n, fmt.Errorf("chunk %v no longer exists on server %v", handle, cs.ServerAddr)
+	}
+	return n, nil
 }
 
-func (cs *ChunkServer) doMutate(handle common.ChunkHandle, mutation *common.Mutation) error {
+func (cs *ChunkServer) doMutate(handle common.ChunkHandle, mutation *common.Mutation) (int, error) {
 	var shouldLock bool
 
 	if mutation.MutationType == common.MutationAppend || mutation.MutationType == common.MutationWrite {
@@ -1361,14 +1382,14 @@ func (cs *ChunkServer) doMutate(handle common.ChunkHandle, mutation *common.Muta
 	}
 
 	var err error
-
+	var n int
 	if mutation.MutationType == common.MutationPad {
 		mutation.Data = []byte{0}
-		err = cs.writeChunk(handle, mutation.Data, mutation.MutationType, common.ChunkMaxSizeInByte-8, shouldLock)
+		n, err = cs.writeChunk(handle, mutation.Data, mutation.MutationType, mutation.Offset, shouldLock)
 	} else {
-		err = cs.writeChunk(handle, mutation.Data, mutation.MutationType, mutation.Offset, shouldLock)
+		n, err = cs.writeChunk(handle, mutation.Data, mutation.MutationType, mutation.Offset, shouldLock)
 	}
-	return err
+	return n, err
 }
 
 // writeChunk writes data to a chunk file at the specified offset with the given mutation type.
@@ -1388,44 +1409,37 @@ func (cs *ChunkServer) doMutate(handle common.ChunkHandle, mutation *common.Muta
 // Returns:
 //   - error: Returns an error if the data size exceeds the maximum chunk size, the file cannot be opened,
 //     written to, or read for checksum calculation, or if file closing fails. Returns nil if the write is successful.
-func (cs *ChunkServer) writeChunk(handle common.ChunkHandle, data []byte, mutationType common.MutationType, offset common.Offset, lock bool) error {
+func (cs *ChunkServer) writeChunk(handle common.ChunkHandle, data []byte, mutationType common.MutationType, offset common.Offset, lock bool) (int, error) {
 	cs.mu.RLock()
 	chInfo, ok := cs.chunks[handle]
 	cs.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("chunk %v on server %v does not exist", handle, cs.ServerAddr)
+		return 0, fmt.Errorf("chunk %v on server %v does not exist", handle, cs.ServerAddr)
 	}
 
 	if mutationType != common.MutationWrite && mutationType != common.MutationAppend {
-		return fmt.Errorf("invalid mutation type for chunk %v: %v", handle, mutationType)
+		return 0, fmt.Errorf("invalid mutation type for chunk %v: %v", handle, mutationType)
 	}
-
-	chInfo.Lock()
-	newLen := offset + common.Offset(len(data))
-	if newLen > chInfo.length {
-		chInfo.length = newLen
-	}
-	if newLen > common.ChunkMaxSizeInByte {
-		chInfo.Unlock()
-		return fmt.Errorf("data size for chunk %v on server %v exceeds max size %v bytes", handle, cs.ServerAddr, common.ChunkMaxSizeInByte)
-	}
-	chInfo.Unlock()
 
 	if lock {
 		cs.mu.Lock()
 		defer cs.mu.Unlock()
 	}
 
-	fileFlag := os.O_CREATE
-	if mutationType == common.MutationAppend {
-		fileFlag |= os.O_APPEND
-	} else {
-		fileFlag |= os.O_RDWR
+	newLen := offset + common.Offset(len(data))
+	if newLen > common.ChunkMaxSizeInByte {
+		return 0, fmt.Errorf("data size for chunk %v on server %v exceeds max size %v bytes", handle, cs.ServerAddr, common.ChunkMaxSizeInByte)
 	}
 
-	fs, err := cs.rootDir.GetFile(fmt.Sprintf(common.ChunkFileNameFormat, handle), fileFlag, 0644)
+	chInfo.Lock()
+	defer chInfo.Unlock()
+	if newLen > chInfo.length {
+		chInfo.length = newLen
+	}
+
+	fs, err := cs.rootDir.GetFile(fmt.Sprintf(common.ChunkFileNameFormat, handle), os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func(fs *os.File) {
 		if err := fs.Close(); err != nil {
@@ -1433,15 +1447,34 @@ func (cs *ChunkServer) writeChunk(handle common.ChunkHandle, data []byte, mutati
 		}
 	}(fs)
 
-	n, err := fs.WriteAt(data, int64(offset))
-	if err != nil {
-		log.Err(err).Msgf("failed to write to chunk %v at offset %v", handle, offset)
-		return err
+	log.Info().Msgf("Server %v writing data to chunk %v at offset %v", cs.ServerAddr, handle, offset)
+	var n int
+	for {
+		if mutationType == common.MutationAppend {
+			_, err := fs.Seek(0, io.SeekEnd)
+			if err != nil {
+				return 0, err
+			}
+			n, err = fs.Write(data)
+			if err != nil {
+				log.Err(err).Msgf("failed to append to chunk %v at offset %v", handle, offset)
+				return 0, err
+			}
+		} else {
+			n, err = fs.WriteAt(data, int64(offset))
+			if err != nil {
+				log.Err(err).Msgf("failed to write to chunk %v at offset %v", handle, offset)
+				return 0, err
+			}
+		}
+		log.Debug().Msgf("[%s] Wrote %d bytes to chunk %v at offset %v", cs.ServerAddr, n, handle, offset)
+		if n < len(data) {
+			data = data[n:]
+			offset += common.Offset(n)
+			continue
+		}
+		break
 	}
-	log.Debug().Msgf("Wrote %d bytes to chunk %v at offset %v", n, handle, offset)
-
-	chInfo.Lock()
-	defer chInfo.Unlock()
 	chInfo.lastModified = time.Now()
 	if newLen >= common.ChunkMaxSizeInByte {
 		chInfo.completed = true
@@ -1450,10 +1483,10 @@ func (cs *ChunkServer) writeChunk(handle common.ChunkHandle, data []byte, mutati
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, fs); err != nil {
 		log.Err(err).Msgf("failed to read chunk %v for checksum", handle)
-		return err
+		return 0, err
 	}
 	chInfo.checksum = common.Checksum(hasher.Sum(nil))
-	return nil
+	return int(newLen), nil
 }
 
 // readChunk reads data from a chunk file at the specified offset into the provided data buffer.
@@ -1473,6 +1506,7 @@ func (cs *ChunkServer) writeChunk(handle common.ChunkHandle, data []byte, mutati
 func (cs *ChunkServer) readChunk(handle common.ChunkHandle, offset common.Offset, data []byte) (int, error) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+
 	filename := fmt.Sprintf(common.ChunkFileNameFormat, handle)
 	f, err := cs.rootDir.GetFile(filename, os.O_RDONLY, common.FileMode)
 	if err != nil {
