@@ -381,6 +381,17 @@ func (nm *NamespaceManager) Rename(source, target common.Path) error {
 
 	node := cwd.childrenNodes[srcDirnameOrFilename]
 	delete(cwd.childrenNodes, srcDirnameOrFilename)
+
+	err = nm.MkDirAll(common.Path(targetDirpath))
+	if err != nil {
+		return err
+	}
+
+	err = nm.Create(common.Path(target))
+	if err != nil {
+		return err
+	}
+
 	cwd.childrenNodes[targetDirnameOrFilename] = node
 	node.Path = target
 	return nil
