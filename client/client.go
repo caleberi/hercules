@@ -1,10 +1,10 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
 	"strings"
 	"sync"
@@ -18,248 +18,291 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type Client struct {
-	mu           sync.RWMutex
-	done         chan bool
-	masterServer common.ServerAddr
-	leaseCache   map[common.ChunkHandle]*common.Lease
+// HerculesClient represents a client for interacting with a distributed file system.
+// It manages leases for chunk servers and communicates with the master server for file operations.
+type HerculesClient struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	cache    map[common.ChunkHandle]*common.Lease
+	cacheMux sync.RWMutex
+	master   common.ServerAddr
 }
 
-func NewClient(addr common.ServerAddr, cacheTickerDuration time.Duration) *Client {
-	cl := &Client{
-		masterServer: addr,
-		mu:           sync.RWMutex{},
-		done:         make(chan bool, 1),
-		leaseCache:   make(map[common.ChunkHandle]*common.Lease),
+// NewHerculesClient creates a new HerculesClient instance.
+// It initializes the client with a context, master server address, and a cleanup duration for expired leases.
+// The cleanup goroutine is started to periodically remove expired leases from the cache.
+//
+// Parameters:
+//   - ctx: The context for managing the client's lifecycle.
+//   - address: The address of the master server.
+//   - cleanup: The duration between lease cleanup operations.
+//
+// Returns:
+//   - A pointer to the initialized HerculesClient.
+func NewHerculesClient(ctx context.Context, address common.ServerAddr, cleanup time.Duration) *HerculesClient {
+	actx, cancelFunc := context.WithCancel(ctx)
+	hercules := &HerculesClient{
+		ctx:    actx,
+		master: address,
+		cancel: cancelFunc,
+		cache:  make(map[common.ChunkHandle]*common.Lease),
 	}
 
-	go func() {
-		tick := time.NewTicker(cacheTickerDuration)
-		action := func(handle common.ChunkHandle, lease *common.Lease) {
-			if lease.IsExpired(time.Now().Add(30 * time.Second)) {
-				delete(cl.leaseCache, lease.Handle)
-			}
-		}
-		for {
-			select {
-			case <-tick.C:
-				cl.mu.Lock()
-				utils.IterateOverMap(cl.leaseCache, action)
-				cl.mu.Unlock()
-			case <-cl.done:
-				return
-			}
-		}
-	}()
-
-	return cl
+	go hercules.cleanLease(cleanup)
+	return hercules
 }
 
-func (c *Client) Close() {
-	c.done <- true
-	close(c.done)
+// cleanLease periodically removes expired leases from the cache.
+// It runs in a goroutine and checks for expired leases at the specified interval.
+// The cleanup stops when the client's context is canceled.
+//
+// Parameters:
+//   - d: The duration between cleanup operations.
+func (hercules *HerculesClient) cleanLease(d time.Duration) {
+	cleanup := func(handle common.ChunkHandle, lease *common.Lease) {
+		if lease.IsExpired(time.Now().Add(common.LeaseTimeout)) {
+			delete(hercules.cache, lease.Handle)
+		}
+	}
+	for {
+		select {
+		case <-hercules.ctx.Done():
+			return
+		default:
+		}
+		<-time.After(d)
+		hercules.cacheMux.Lock()
+		utils.IterateOverMap(hercules.cache, cleanup)
+		hercules.cacheMux.Unlock()
+	}
 }
 
-func (c *Client) getLease(
-	handle common.ChunkHandle,
-	offset common.Offset) (*common.Lease, common.Offset, error) {
-	c.mu.RLock()
-	lease, ok := c.leaseCache[handle]
-	c.mu.RUnlock()
-	if ok {
+// GetChunkServers retrieves the lease information for a given chunk handle.
+// It checks the cache first and, if not found, queries the master server for primary and secondary server information.
+// The retrieved lease is cached for future use.
+//
+// Parameters:
+//   - handle: The chunk handle to retrieve lease information for.
+//
+// Returns:
+//   - A pointer to the lease information.
+//   - An error if the lease cannot be retrieved or is expired.
+func (hercules *HerculesClient) GetChunkServers(handle common.ChunkHandle) (*common.Lease, error) {
+	hercules.cacheMux.RLock()
+	lease, exists := hercules.cache[handle]
+	hercules.cacheMux.RUnlock()
+	if exists {
+		return lease, nil
+	}
+
+	var primaryAndSecondaryServersReply rpc_struct.PrimaryAndSecondaryServersInfoReply
+
+	err := shared.UnicastToRPCServer(
+		string(hercules.master), rpc_struct.MRPCGetPrimaryAndSecondaryServersInfoHandler,
+		rpc_struct.PrimaryAndSecondaryServersInfoArg{Handle: handle}, &primaryAndSecondaryServersReply,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	newLease := &common.Lease{
+		Handle:      handle,
+		Expire:      primaryAndSecondaryServersReply.Expire,
+		Primary:     primaryAndSecondaryServersReply.Primary,
+		Secondaries: primaryAndSecondaryServersReply.SecondaryServers,
+	}
+
+	if newLease.IsExpired(time.Now()) {
+		return nil, fmt.Errorf("GetChunkServers = %v has expired before use", lease)
+	}
+
+	hercules.cacheMux.Lock()
+	defer hercules.cacheMux.Unlock()
+	hercules.cache[handle] = newLease
+
+	return hercules.cache[handle], nil
+}
+
+// ObtainLease retrieves or creates a lease for a given chunk handle and offset.
+// It checks the cache for an existing lease and, if not found, calls GetChunkServers to retrieve one.
+//
+// Parameters:
+//   - handle: The chunk handle to obtain a lease for.
+//   - offset: The offset within the chunk (currently unused in this implementation).
+//
+// Returns:
+//   - A pointer to the lease information.
+//   - The offset (always 0 in this implementation).
+//   - An error if the lease cannot be retrieved.
+func (hercules *HerculesClient) ObtainLease(handle common.ChunkHandle, offset common.Offset) (*common.Lease, common.Offset, error) {
+	hercules.cacheMux.RLock()
+	lease, exists := hercules.cache[handle]
+	if exists {
+		hercules.cacheMux.RUnlock()
 		return lease, 0, nil
 	}
-	ls, err := c.GetChunkServers(handle)
+	hercules.cacheMux.RUnlock()
+
+	lease, err := hercules.GetChunkServers(handle)
 	if err != nil {
-		log.Err(err).Stack()
 		return nil, offset, common.Error{
 			Code: common.UnknownError,
 			Err:  "could not retrieve lease",
 		}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if ls.IsExpired(time.Now()) {
-		log.Info().Msgf("getLease = %v has expired before use", ls)
-		return nil, 0, fmt.Errorf("getLease = %v has expired before use", ls)
-	}
-	c.leaseCache[handle] = ls
-	return ls, 0, nil
+	return lease, 0, nil
 }
 
-func (c *Client) GetChunkHandle(
-	path common.Path,
-	offset common.ChunkIndex) (common.ChunkHandle, error) {
+// GetChunkHandle retrieves the chunk handle for a given file path and chunk index.
+// It sends an RPC request to the master server to obtain the chunk handle.
+//
+// Parameters:
+//   - path: The file path.
+//   - offset: The chunk index.
+//
+// Returns:
+//   - The chunk handle.
+//   - An error if the RPC call fails.
+func (hercules *HerculesClient) GetChunkHandle(path common.Path, offset common.ChunkIndex) (common.ChunkHandle, error) {
 	var reply rpc_struct.GetChunkHandleReply
-	err := shared.UnicastToRPCServer(
-		string(c.masterServer),
-		rpc_struct.MRPCGetChunkHandleHandler,
-		rpc_struct.GetChunkHandleArgs{
-			Path:  path,
-			Index: offset,
-		}, &reply)
+	err := shared.UnicastToRPCServer(string(hercules.master),
+		rpc_struct.MRPCGetChunkHandleHandler, rpc_struct.GetChunkHandleArgs{Path: path, Index: offset}, &reply)
 	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
 		return -1, err
 	}
 	return reply.Handle, nil
 }
 
-func (c *Client) GetChunkServers(handle common.ChunkHandle) (*common.Lease, error) {
-	c.mu.RLock()
-	ls, ok := c.leaseCache[handle]
-	c.mu.RUnlock()
-
-	if !ok {
-		var info rpc_struct.PrimaryAndSecondaryServersInfoReply
-
-		if err := shared.UnicastToRPCServer(
-			string(c.masterServer),
-			rpc_struct.MRPCGetPrimaryAndSecondaryServersInfoHandler,
-			rpc_struct.PrimaryAndSecondaryServersInfoArg{Handle: handle},
-			&info,
-		); err != nil {
-			return nil, err
-		}
-
-		nls := &common.Lease{
-			Handle:      handle,
-			Expire:      info.Expire,
-			Primary:     info.Primary,
-			Secondaries: info.SecondaryServers,
-		}
-
-		if nls.IsExpired(time.Now()) {
-			log.Info().Msgf("GetChunkServers = %v has expired before use", nls)
-			return nil, fmt.Errorf("GetChunkServers = %v has expired before use", ls)
-		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.leaseCache[handle] = nls
-		return c.leaseCache[handle], nil
-	}
-	return ls, nil
+// MkDir creates a directory at the specified path.
+// It sends an RPC request to the master server to create the directory.
+//
+// Parameters:
+//   - path: The path of the directory to create.
+//
+// Returns:
+//   - An error if the RPC call fails.
+func (hercules *HerculesClient) MkDir(path common.Path) error {
+	reply := &rpc_struct.MakeDirectoryReply{}
+	return shared.UnicastToRPCServer(
+		string(hercules.master),
+		rpc_struct.MRPCMkdirHandler,
+		rpc_struct.MakeDirectoryArgs{Path: path}, reply)
 }
 
-func (c *Client) List(path common.Path) ([]common.PathInfo, error) {
-	var (
-		result []common.PathInfo
-		args   rpc_struct.GetPathInfoArgs
-		reply  rpc_struct.GetPathInfoReply
-	)
-
-	if err := shared.UnicastToRPCServer(
-		string(c.masterServer), rpc_struct.MRPCListHandler, args, &reply); err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return nil, err
-	}
-
-	result = reply.Entries
-	return result, nil
-}
-
-func (c *Client) MkDir(path common.Path) error {
-	var (
-		args  rpc_struct.MakeDirectoryArgs
-		reply rpc_struct.MakeDirectoryReply
-	)
-	args.Path = path
-	if err := shared.UnicastToRPCServer(
-		string(c.masterServer), rpc_struct.MRPCMkdirHandler, args, &reply); err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return err
-	}
-	return nil
-}
-
-func (c *Client) CreateFile(path common.Path) error {
-	var (
-		args  rpc_struct.CreateFileArgs
-		reply rpc_struct.CreateFileReply
-	)
-	args.Path = path
-	err := shared.UnicastToRPCServer(
-		string(c.masterServer),
+// CreateFile creates a file at the specified path.
+// It sends an RPC request to the master server to create the file.
+//
+// Parameters:
+//   - path: The path of the file to create.
+//
+// Returns:
+//   - An error if the RPC call fails.
+func (hercules *HerculesClient) CreateFile(path common.Path) error {
+	reply := &rpc_struct.CreateFileReply{}
+	return shared.UnicastToRPCServer(
+		string(hercules.master),
 		rpc_struct.MRPCCreateFileHandler,
-		args, &reply)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return err
-	}
-	return nil
+		rpc_struct.CreateFileArgs{Path: path}, reply)
 }
 
-func (c *Client) DeleteFile(path common.Path) error {
-	var (
-		args  rpc_struct.DeleteFileArgs
-		reply rpc_struct.DeleteFileReply
-	)
-	args.Path = path
-	err := shared.UnicastToRPCServer(string(c.masterServer), rpc_struct.MRPCDeleteFileHandler, args, &reply)
+// List retrieves the list of file or directory entries at the specified path.
+// It sends an RPC request to the master server to obtain the path information.
+//
+// Parameters:
+//   - path: The path to list entries for.
+//
+// Returns:
+//   - A slice of PathInfo containing the entries.
+//   - An error if the RPC call fails.
+func (hercules *HerculesClient) List(path common.Path) ([]common.PathInfo, error) {
+	reply := &rpc_struct.GetPathInfoReply{}
+	err := shared.UnicastToRPCServer(string(hercules.master), rpc_struct.MRPCListHandler, rpc_struct.GetPathInfoArgs{}, reply)
 	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return err
+		return nil, err
 	}
-	return nil
+	return reply.Entries, nil
 }
 
-func (c *Client) RenameFile(source, target common.Path) error {
-	var (
-		args  rpc_struct.RenameFileArgs
-		reply rpc_struct.RenameFileReply
-	)
-	args.Source = source
-	args.Target = target
-	err := shared.UnicastToRPCServer(string(c.masterServer), rpc_struct.MRPCRenameHandler, args, &reply)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return err
-	}
-	return nil
+// DeleteFile deletes a file at the specified path.
+// It sends an RPC request to the master server to delete the file.
+//
+// Parameters:
+//   - path: The path of the file to delete.
+//
+// Returns:
+//   - An error if the RPC call fails.
+func (hercules *HerculesClient) DeleteFile(path common.Path) error {
+	reply := &rpc_struct.DeleteFileReply{}
+	return shared.UnicastToRPCServer(
+		string(hercules.master), rpc_struct.MRPCDeleteFileHandler,
+		rpc_struct.DeleteFileArgs{Path: path}, reply)
 }
 
-func (c *Client) GetFile(path common.Path) (*common.FileInfo, error) {
-	var (
-		args  rpc_struct.GetFileInfoArgs
-		reply rpc_struct.GetFileInfoReply
-	)
-	args.Path = path
+// RenameFile renames a file from the source path to the target path.
+// It sends an RPC request to the master server to perform the rename operation.
+//
+// Parameters:
+//   - source: The current path of the file.
+//   - target: The new path for the file.
+//
+// Returns:
+//   - An error if the RPC call fails.
+func (hercules *HerculesClient) RenameFile(source, target common.Path) error {
+	reply := &rpc_struct.RenameFileReply{}
+	return shared.UnicastToRPCServer(
+		string(hercules.master), rpc_struct.MRPCRenameHandler, rpc_struct.RenameFileArgs{Source: source, Target: target}, reply)
+}
+
+// GetFile retrieves the file information for the specified path.
+// It sends an RPC request to the master server to obtain the file details.
+//
+// Parameters:
+//   - path: The path of the file to retrieve information for.
+//
+// Returns:
+//   - A pointer to FileInfo containing the file details.
+//   - An error if the RPC call fails.
+func (hercules *HerculesClient) GetFile(path common.Path) (*common.FileInfo, error) {
+	reply := &rpc_struct.GetFileInfoReply{}
 	err := shared.UnicastToRPCServer(
-		string(c.masterServer),
-		rpc_struct.MRPCGetFileInfoHandler, args, &reply)
+		string(hercules.master),
+		rpc_struct.MRPCGetFileInfoHandler, rpc_struct.GetFileInfoArgs{Path: path}, reply)
 	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
 		return nil, err
 	}
 
-	var fileInfo common.FileInfo
-	fileInfo.Chunks = reply.Chunks
-	fileInfo.IsDir = reply.IsDir
-	fileInfo.Length = reply.Length
-	return &fileInfo, err
+	return &common.FileInfo{
+		Chunks: reply.Chunks,
+		IsDir:  reply.IsDir,
+		Length: reply.Length}, err
 }
 
-func (c *Client) Read(path common.Path, offset common.Offset, data []byte) (n int, err error) {
-	var (
-		args  rpc_struct.GetFileInfoArgs
-		reply rpc_struct.GetFileInfoReply
-	)
-	args.Path = path
-	err = shared.UnicastToRPCServer(
-		string(c.masterServer), rpc_struct.MRPCGetFileInfoHandler, args, &reply)
+// Read reads data from a file at the specified path and offset into the provided buffer.
+// It retrieves the file information, validates the offset, and reads data from the appropriate chunk servers.
+//
+// Parameters:
+//   - path: The path of the file to read from.
+//   - offset: The offset within the file to start reading.
+//   - data: The buffer to store the read data.
+//
+// Returns:
+//   - The number of bytes read.
+//   - An error if the read operation fails, including EOF if the end of the file is reached.
+func (hercules *HerculesClient) Read(path common.Path, offset common.Offset, data []byte) (n int, err error) {
+
+	args := rpc_struct.GetFileInfoArgs{Path: path}
+	reply := &rpc_struct.GetFileInfoReply{}
+	err = shared.UnicastToRPCServer(string(hercules.master), rpc_struct.MRPCGetFileInfoHandler, args, reply)
 	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
+		return -1, err
 	}
 
 	if offset/common.ChunkMaxSizeInByte > common.Offset(reply.Chunks) {
-		err = fmt.Errorf("offset [%v] cannot be greater than the file size", offset)
-		return
+		return -1, fmt.Errorf("offset [%v] cannot be greater than the file size", offset)
 	}
 
 	if reply.IsDir {
-		err = fmt.Errorf("cannot read %s since it is a directory", path)
-		return
+		return -1, fmt.Errorf("cannot read %s since it is a directory", path)
 	}
 
 	pos := 0
@@ -268,30 +311,26 @@ func (c *Client) Read(path common.Path, offset common.Offset, data []byte) (n in
 		chunkOffset := offset % common.ChunkMaxSizeInByte
 
 		if index > common.Offset(reply.Chunks) {
-			err = common.Error{Code: common.ReadEOF, Err: "EOF over chunk"}
-			return
+			return -1, common.Error{Code: common.ReadEOF, Err: "EOF over chunk"}
 		}
 
 		var handle common.ChunkHandle
-		handle, err = c.GetChunkHandle(args.Path, common.ChunkIndex(index))
+		handle, err = hercules.GetChunkHandle(args.Path, common.ChunkIndex(index))
 		if err != nil {
-			log.Err(err).Stack().Msg(err.Error())
-			return
+			return -1, err
 		}
-		var n int
-		for {
-			n, err = c.ReadChunk(handle, chunkOffset, data[pos:])
-			if err == nil || err.(common.Error).Code == common.ReadEOF {
+
+		n, err := hercules.ReadChunk(handle, chunkOffset, data[pos:])
+
+		if err != nil {
+			if err.(common.Error).Code == common.ReadEOF {
 				break
 			}
-			log.Err(err).Stack().Msg(err.Error())
+			return -1, err
 		}
 
 		offset += common.Offset(n)
 		pos += n
-		if err != nil {
-			break
-		}
 	}
 
 	if err != nil && err.(common.Error).Code == common.ReadEOF {
@@ -301,7 +340,18 @@ func (c *Client) Read(path common.Path, offset common.Offset, data []byte) (n in
 	return pos, err
 }
 
-func (c *Client) ReadChunk(handle common.ChunkHandle, offset common.Offset, data []byte) (int, error) {
+// ReadChunk reads data from a specific chunk at the given handle and offset into the provided buffer.
+// It queries the master server for replica locations and reads from a randomly chosen replica.
+//
+// Parameters:
+//   - handle: The chunk handle to read from.
+//   - offset: The offset within the chunk to start reading.
+//   - data: The buffer to store the read data.
+//
+// Returns:
+//   - The number of bytes read.
+//   - An error if the read operation fails, including EOF if the end of the chunk is reached.
+func (hercules *HerculesClient) ReadChunk(handle common.ChunkHandle, offset common.Offset, data []byte) (int, error) {
 	var readLength int
 
 	if common.ChunkMaxSizeInByte-offset > common.Offset(len(data)) {
@@ -316,7 +366,7 @@ func (c *Client) ReadChunk(handle common.ChunkHandle, offset common.Offset, data
 	)
 	replicasArgs.Handle = handle
 	err := shared.UnicastToRPCServer(
-		string(c.masterServer),
+		string(hercules.master),
 		rpc_struct.MRPCGetReplicasHandler,
 		replicasArgs, &replicasReply)
 	if err != nil {
@@ -346,7 +396,6 @@ func (c *Client) ReadChunk(handle common.ChunkHandle, offset common.Offset, data
 		&readChunkReply)
 
 	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
 		return 0, common.Error{Code: common.UnknownError, Err: err.Error()}
 	}
 
@@ -359,37 +408,40 @@ func (c *Client) ReadChunk(handle common.ChunkHandle, offset common.Offset, data
 
 }
 
-func (c *Client) Write(path common.Path, offset common.Offset, data []byte) error {
-	var (
-		args  rpc_struct.GetFileInfoArgs
-		reply rpc_struct.GetFileInfoReply
-	)
-	args.Path = path
-	err := shared.UnicastToRPCServer(
-		string(c.masterServer),
-		rpc_struct.MRPCGetFileInfoHandler,
-		args, &reply)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return err
+// Write writes data to a file at the specified path and offset.
+// It retrieves the file information, validates the offset, and writes data to the appropriate chunk servers.
+//
+// Parameters:
+//   - path: The path of the file to write to.
+//   - offset: The offset within the file to start writing.
+//   - data: The data to write.
+//
+// Returns:
+//   - The number of bytes written.
+//   - An error if the write operation fails.
+func (hercules *HerculesClient) Write(path common.Path, offset common.Offset, data []byte) (int, error) {
+
+	args := rpc_struct.GetFileInfoArgs{Path: path}
+	reply := rpc_struct.GetFileInfoReply{}
+	if err := shared.UnicastToRPCServer(string(hercules.master), rpc_struct.MRPCGetFileInfoHandler, args, &reply); err != nil {
+		return -1, err
 	}
 
 	if offset/common.ChunkMaxSizeInByte > common.Offset(reply.Chunks) {
-		return fmt.Errorf("write offset [%v] cannot be greater than the file size", offset)
+		return -1, fmt.Errorf("write offset [%v] cannot be greater than the file size", offset)
 	}
 
 	if reply.IsDir {
-		return fmt.Errorf("cannot read %s since it is a directory", path)
+		return -1, fmt.Errorf("cannot read %s since it is a directory", path)
 	}
 
 	pos := 0
 	for pos < len(data) {
 		index := common.Offset(offset / common.ChunkMaxSizeInByte)
 		chunkOffset := offset % common.ChunkMaxSizeInByte
-		handle, err := c.GetChunkHandle(args.Path, common.ChunkIndex(index))
+		handle, err := hercules.GetChunkHandle(args.Path, common.ChunkIndex(index))
 		if err != nil {
-			log.Err(err).Stack().Msg(err.Error())
-			return err
+			return -1, err
 		}
 
 		writeMax := int(common.ChunkMaxSizeInByte - chunkOffset)
@@ -399,38 +451,46 @@ func (c *Client) Write(path common.Path, offset common.Offset, data []byte) erro
 		} else {
 			writeLength = writeMax
 		}
-
-		err = c.WriteChunk(handle, chunkOffset, data[pos:pos+writeLength])
+		n, err := hercules.WriteChunk(handle, chunkOffset, data[pos:pos+writeLength])
 		if err != nil {
-			log.Err(err).Stack().Msg(err.Error())
-			break
+			return -1, err
 		}
-
 		offset += common.Offset(writeLength)
-		pos += writeLength
+		pos += n
 		if pos == len(data) {
 			break
 		}
 	}
 
-	return nil
+	return -1, nil
 }
 
-func (c *Client) WriteChunk(handle common.ChunkHandle, offset common.Offset, data []byte) error {
+// WriteChunk writes data to a specific chunk at the given handle and offset.
+// It obtains a lease, forwards the data to secondary replicas, and writes to the primary replica.
+//
+// Parameters:
+//   - handle: The chunk handle to write to.
+//   - offset: The offset within the chunk to start writing.
+//   - data: The data to write.
+//
+// Returns:
+//   - The number of bytes written.
+//   - An error if the write operation fails.
+func (hercules *HerculesClient) WriteChunk(handle common.ChunkHandle, offset common.Offset, data []byte) (int, error) {
 	totalDataLengthToWrite := len(data) + int(offset)
 
 	if totalDataLengthToWrite > common.ChunkMaxSizeInByte {
-		return fmt.Errorf("totalDataLengthToWrite = %v is greater than the max chunk size %v", totalDataLengthToWrite, common.ChunkMaxSizeInByte)
+		return -1, fmt.Errorf("totalDataLengthToWrite = %v is greater than the max chunk size %v", totalDataLengthToWrite, common.ChunkMaxSizeInByte)
 	}
 
-	writeLease, offset, err := c.getLease(handle, offset)
+	writeLease, offset, err := hercules.ObtainLease(handle, offset)
 	if err != nil {
-		return err
+		return -1, err
 	}
 	servers := append(writeLease.Secondaries, writeLease.Primary)
 	copy(utils.Filter(servers, func(v common.ServerAddr) bool { return string(v) != "" }), servers)
 	if len(servers) == 0 {
-		return common.Error{Code: common.UnknownError, Err: "no replica"}
+		return -1, common.Error{Code: common.UnknownError, Err: "no replica"}
 	}
 
 	if writeLease.Primary == "" {
@@ -438,11 +498,9 @@ func (c *Client) WriteChunk(handle common.ChunkHandle, offset common.Offset, dat
 		servers = servers[1:]
 	}
 
-	log.Info().Msgf("Servers from the lease = %v", servers)
 	dataID := downloadbuffer.NewDownloadBufferId(handle)
 
 	var errs []string
-	log.Info().Msgf("RPCForwardDataHandler = %v", servers)
 	utils.ForEach(servers, func(addr common.ServerAddr) {
 		var d rpc_struct.ForwardDataReply
 		if addr != "" {
@@ -470,134 +528,140 @@ func (c *Client) WriteChunk(handle common.ChunkHandle, offset common.Offset, dat
 		Replicas:         servers,
 	}
 
-	return shared.UnicastToRPCServer(
+	writeReply := &rpc_struct.WriteChunkReply{}
+	err = shared.UnicastToRPCServer(
 		string(writeLease.Primary),
 		rpc_struct.CRPCWriteChunkHandler,
 		writeArgs,
-		&rpc_struct.WriteChunkReply{},
+		writeReply,
 	)
+	if err != nil {
+		return -1, err
+	}
+
+	return writeReply.Length, err
 }
 
-func (c *Client) Append(path common.Path, data []byte) (offset common.Offset, err error) {
-	if len(data) > common.AppendMaxSizeInByte {
-		return 0, fmt.Errorf("len of data [%v] > max append size [%v]", len(data), common.AppendMaxSizeInByte)
-	}
+// func (c *Client) Append(path common.Path, data []byte) (offset common.Offset, err error) {
+// 	if len(data) > common.AppendMaxSizeInByte {
+// 		return 0, fmt.Errorf("len of data [%v] > max append size [%v]", len(data), common.AppendMaxSizeInByte)
+// 	}
 
-	var (
-		args  rpc_struct.GetFileInfoArgs
-		reply rpc_struct.GetFileInfoReply
-	)
-	args.Path = path
-	err = shared.UnicastToRPCServer(string(c.masterServer), "MasterServer.RPCGetFileInfoHandler", args, &reply)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
-	}
+// 	var (
+// 		args  rpc_struct.GetFileInfoArgs
+// 		reply rpc_struct.GetFileInfoReply
+// 	)
+// 	args.Path = path
+// 	err = shared.UnicastToRPCServer(string(c.masterServer), "MasterServer.RPCGetFileInfoHandler", args, &reply)
+// 	if err != nil {
+// 		log.Err(err).Stack().Msg(err.Error())
+// 		return
+// 	}
 
-	// use the last chunk we created on the master server since
-	// we are doing an appended mutation
-	start := common.ChunkIndex(math.Max(float64(reply.Chunks-1), 0.0))
-	var (
-		handle      common.ChunkHandle
-		chunkOffset common.Offset
-	)
+// 	// use the last chunk we created on the master server since
+// 	// we are doing an appended mutation
+// 	start := common.ChunkIndex(math.Max(float64(reply.Chunks-1), 0.0))
+// 	var (
+// 		handle      common.ChunkHandle
+// 		chunkOffset common.Offset
+// 	)
 
-	totalWritten := 0
-	for totalWritten < len(data) {
-		handle, err = c.GetChunkHandle(args.Path, common.ChunkIndex(start))
-		if err != nil {
-			log.Err(err).Stack().Msg(err.Error())
-			return
-		}
+// 	totalWritten := 0
+// 	for totalWritten < len(data) {
+// 		handle, err = c.GetChunkHandle(args.Path, common.ChunkIndex(start))
+// 		if err != nil {
+// 			log.Err(err).Stack().Msg(err.Error())
+// 			return
+// 		}
 
-		chunkOffset, err = c.AppendChunk(handle, data)
-		if err != nil {
-			log.Err(err).Stack().Msg(err.Error())
-			if err.(common.Error).Code == common.AppendExceedChunkSize {
-				continue
-			}
-			break
-		}
+// 		chunkOffset, err = c.AppendChunk(handle, data)
+// 		if err != nil {
+// 			log.Err(err).Stack().Msg(err.Error())
+// 			if err.(common.Error).Code == common.AppendExceedChunkSize {
+// 				continue
+// 			}
+// 			break
+// 		}
 
-		totalWritten += int(chunkOffset)
-		start++
-		log.Info().Msg("padding more on next chunk")
-	}
-	offset = common.Offset(start)*common.ChunkMaxSizeInByte + chunkOffset
-	return
-}
+// 		totalWritten += int(chunkOffset)
+// 		start++
+// 		log.Info().Msg("padding more on next chunk")
+// 	}
+// 	offset = common.Offset(start)*common.ChunkMaxSizeInByte + chunkOffset
+// 	return
+// }
 
-func (c *Client) AppendChunk(handle common.ChunkHandle, data []byte) (common.Offset, error) {
-	var offset common.Offset
+// func (c *Client) AppendChunk(handle common.ChunkHandle, data []byte) (common.Offset, error) {
+// 	var offset common.Offset
 
-	if len(data) > common.AppendMaxSizeInByte {
-		return offset, common.Error{
-			Code: common.UnknownError,
-			Err:  fmt.Sprintf("len(data)[%v]  > max append size (%v)", len(data), common.AppendExceedChunkSize),
-		}
-	}
+// 	if len(data) > common.AppendMaxSizeInByte {
+// 		return offset, common.Error{
+// 			Code: common.UnknownError,
+// 			Err:  fmt.Sprintf("len(data)[%v]  > max append size (%v)", len(data), common.AppendExceedChunkSize),
+// 		}
+// 	}
 
-	appendLease, offset, err := c.getLease(handle, 0)
-	if err != nil {
-		return offset, err
-	}
+// 	appendLease, offset, err := c.getLease(handle, 0)
+// 	if err != nil {
+// 		return offset, err
+// 	}
 
-	servers := append(appendLease.Secondaries, appendLease.Primary)
-	copy(utils.Filter(servers, func(v common.ServerAddr) bool { return string(v) != "" }), servers)
-	if len(servers) == 0 {
-		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
-	}
+// 	servers := append(appendLease.Secondaries, appendLease.Primary)
+// 	copy(utils.Filter(servers, func(v common.ServerAddr) bool { return string(v) != "" }), servers)
+// 	if len(servers) == 0 {
+// 		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
+// 	}
 
-	if appendLease.Primary == "" {
-		appendLease.Primary = servers[0]
-		appendLease.Secondaries = servers[1:]
-	}
-	if len(servers) == 0 {
-		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
-	}
+// 	if appendLease.Primary == "" {
+// 		appendLease.Primary = servers[0]
+// 		appendLease.Secondaries = servers[1:]
+// 	}
+// 	if len(servers) == 0 {
+// 		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
+// 	}
 
-	dataID := downloadbuffer.NewDownloadBufferId(handle)
-	var errs []string
-	log.Info().Msgf("RPCForwardDataHandler = %v", servers)
-	utils.ForEach(servers, func(addr common.ServerAddr) {
-		var d rpc_struct.ForwardDataReply
-		if addr != "" {
-			replicas := utils.Filter(servers, func(v common.ServerAddr) bool { return v != addr })
-			err = shared.UnicastToRPCServer(string(addr),
-				rpc_struct.CRPCForwardDataHandler,
-				rpc_struct.ForwardDataArgs{
-					DownloadBufferId: dataID,
-					Data:             data,
-					Replicas:         replicas,
-				}, &d)
-			if err != nil {
-				errs = append(errs, err.Error())
-			}
-		}
-	})
-	if len(errs) != 0 {
-		errStr := strings.Join(errs, ";")
-		log.Err(errors.New(errStr)).Stack()
-	}
+// 	dataID := downloadbuffer.NewDownloadBufferId(handle)
+// 	var errs []string
+// 	log.Info().Msgf("RPCForwardDataHandler = %v", servers)
+// 	utils.ForEach(servers, func(addr common.ServerAddr) {
+// 		var d rpc_struct.ForwardDataReply
+// 		if addr != "" {
+// 			replicas := utils.Filter(servers, func(v common.ServerAddr) bool { return v != addr })
+// 			err = shared.UnicastToRPCServer(string(addr),
+// 				rpc_struct.CRPCForwardDataHandler,
+// 				rpc_struct.ForwardDataArgs{
+// 					DownloadBufferId: dataID,
+// 					Data:             data,
+// 					Replicas:         replicas,
+// 				}, &d)
+// 			if err != nil {
+// 				errs = append(errs, err.Error())
+// 			}
+// 		}
+// 	})
+// 	if len(errs) != 0 {
+// 		errStr := strings.Join(errs, ";")
+// 		log.Err(errors.New(errStr)).Stack()
+// 	}
 
-	var (
-		appendArgs  rpc_struct.AppendChunkArgs
-		appendReply rpc_struct.AppendChunkReply
-	)
-	appendArgs.DownloadBufferId = dataID
-	appendArgs.Replicas = appendLease.Secondaries
-	err = shared.UnicastToRPCServer(
-		string(appendLease.Primary),
-		rpc_struct.CRPCAppendChunkHandler,
-		appendArgs, &appendReply)
-	if err != nil {
-		return -1, common.Error{Code: common.UnknownError, Err: err.Error()}
-	}
-	if appendReply.ErrorCode == common.AppendExceedChunkSize {
-		return appendReply.Offset, common.Error{
-			Code: common.UnknownError,
-			Err:  "exceed append chunk size",
-		}
-	}
-	return appendReply.Offset, nil
-}
+// 	var (
+// 		appendArgs  rpc_struct.AppendChunkArgs
+// 		appendReply rpc_struct.AppendChunkReply
+// 	)
+// 	appendArgs.DownloadBufferId = dataID
+// 	appendArgs.Replicas = appendLease.Secondaries
+// 	err = shared.UnicastToRPCServer(
+// 		string(appendLease.Primary),
+// 		rpc_struct.CRPCAppendChunkHandler,
+// 		appendArgs, &appendReply)
+// 	if err != nil {
+// 		return -1, common.Error{Code: common.UnknownError, Err: err.Error()}
+// 	}
+// 	if appendReply.ErrorCode == common.AppendExceedChunkSize {
+// 		return appendReply.Offset, common.Error{
+// 			Code: common.UnknownError,
+// 			Err:  "exceed append chunk size",
+// 		}
+// 	}
+// 	return appendReply.Offset, nil
+// }
