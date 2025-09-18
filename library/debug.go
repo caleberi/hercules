@@ -53,11 +53,11 @@ func init() {
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
-func Debug(topic debugTopic, format string, args ...interface{}) {
+func Debug(topic debugTopic, format string, args ...any) {
 	WDebug(os.Stdout, topic, format, args)
 }
 
-func WDebug(w io.Writer, topic debugTopic, format string, args ...interface{}) {
+func WDebug(w io.Writer, topic debugTopic, format string, args ...any) {
 	if debugVerbosity >= 1 {
 		time := time.Since(debugStartTime).Milliseconds()
 		time /= 1000
