@@ -463,7 +463,7 @@ func (hercules *HerculesClient) Write(path common.Path, offset common.Offset, da
 		}
 	}
 
-	return -1, nil
+	return int(offset), nil
 }
 
 // WriteChunk writes data to a specific chunk at the given handle and offset.
@@ -589,8 +589,10 @@ func (hercules *HerculesClient) Append(path common.Path, data []byte) (offset co
 
 		chunkOffset, err = hercules.AppendChunk(handle, data)
 		if err != nil {
-			if err.(common.Error).Code == common.AppendExceedChunkSize {
-				continue
+			if _, ok := err.(common.Error); ok {
+				if err.(common.Error).Code == common.AppendExceedChunkSize {
+					continue
+				}
 			}
 			break
 		}
@@ -667,7 +669,8 @@ func (hercules *HerculesClient) AppendChunk(handle common.ChunkHandle, data []by
 		}
 	})
 	if len(errs) != 0 {
-		return offset, errors.Join(errs...)
+		err = errors.Join(errs...)
+		return offset, err
 	}
 
 	var (

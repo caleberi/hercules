@@ -1,112 +1,227 @@
 package client
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
 	"testing"
 	"time"
 
+	"github.com/caleberi/distributed-system/chunkserver"
 	"github.com/caleberi/distributed-system/common"
-	"github.com/rs/zerolog/log"
+	"github.com/caleberi/distributed-system/master_server"
+	"github.com/jaswdr/faker/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-var data = []byte(`### Captain America: The Winter Soldier - A Modern Marvel Masterpiece
-**"Captain America: The Winter Soldier"** is a pivotal film in the Marvel Cinematic Universe (MCU), 
-blending high-octane action, espionage, and character-driven storytelling to deliver a superhero movie that transcends the genre.
+func setupMasterServer(t *testing.T, ctx context.Context, root, address string) *master_server.MasterServer {
+	assert.NotEmpty(t, root)
+	assert.NotEmpty(t, address)
 
-#### Plot and Themes
-The film, directed by Anthony and Joe Russo, follows Steve Rogers, aka Captain America (played by Chris Evans), 
-as he adjusts to life in the 21st century after being frozen in ice for decades. The narrative thrust begins when a SHIELD vessel is hijacked, 
-prompting Rogers and Natasha Romanoff, aka Black Widow (Scarlett Johansson), to lead a rescue mission. This sets off a chain of events revealing a dee-seated conspiracy within SHIELD itself, orchestrated by the nefarious organization Hydra.
-Central to the film's plot is the introduction of the Winter Soldier, a mysterious and formidable assassin with a metal arm and a shrouded past. As Rogers digs deeper, he discovers that the Winter Soldier is actually his old friend Bucky Barnes (Sebastian Stan), who has been brainwashed and manipulated by Hydra.
-
-#### A New Direction for the MCU
-
-"The Winter Soldier" is notable for its departure from the more fantastical elements of earlier Marvel films, opting instead for a tone reminiscent of 1970s political thrillers. 
-The film explores themes of trust, freedom, and surveillance, reflecting contemporary concerns about government overreach and the balance between security and privacy.
-This thematic depth is complemented by tightly choreographed action sequences. The film's fight scenes are visceral and grounded, particularly the close-quarters combat between Captain America and the Winter Soldier. The freeway fight and the elevator brawl are standout moments that have been praised for their intensity and choreography.
-
-#### Character Development
-Steve Rogers' character arc in this film is significant. No longer the wide-eyed patriot of "The First Avenger," Rogers is now a man out of time, 
-grappling with the moral complexities of the modern world. His steadfast morality is tested as he navigates a landscape where enemies can be indistinguishable from allies.
-Black Widow also receives substantial development, revealing layers of vulnerability and complexity beneath her spy persona. Her evolving partnership with Rogers adds emotional weight to the narrative,
-as both characters confront their pasts and uncertain futures.
-
-#### Impact on the MCU
-"Captain America: The Winter Soldier" had a profound impact on the MCU. It effectively dismantled SHIELD, a cornerstone of the MCU's narrative infrastructure up to that point,
-forcing subsequent films and TV shows to navigate a world without the organization's stabilizing presence.
-The film also set the stage for "Avengers: Age of Ultron" and "Captain America: Civil War," influencing character motivations and the broader geopolitical landscape of the MCU. 
-The introduction of the Winter Soldier as a tragic antagonist added emotional depth to future storylines, particularly those involving Steve Rogers.
-
-#### Conclusion
-
-"Captain America: The Winter Soldier" is more than just a superhero film; it is a sophisticated thriller that challenges its characters and audience to reconsider their views on heroism, 
-loyalty, and sacrifice. Its successful blend of action, intrigue, and character development makes it one of the standout entries in the Marvel Cinematic Universe, and a benchmark for what 
-superhero films can achieve when they aspire to be more than just spectacle.`)
-
-func TestReadDataFromChunkServer(t *testing.T) {
-	ctx := t.Context()
-	addr := "127.0.0.1:9090"
-	client := NewHerculesClient(ctx, common.ServerAddr(addr), 30*time.Millisecond)
-	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
-	}
-	log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
-	data := make([]byte, 1000)
-	_, err = client.Read("/images/independent-day-101", common.Offset(10), data)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return
-	}
-	log.Print(data)
+	server := master_server.NewMasterServer(ctx, common.ServerAddr(address), root)
+	assert.NotNil(t, server)
+	return server
 }
 
-// func TestWriteDataFromChunkServer(t *testing.T) {
-// 	addr := "127.0.0.1:9090"
-// 	client := NewClient(common.ServerAddr(addr), 30*time.Millisecond)
-// 	defer client.Close()
-// 	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
-// 	if err != nil {
-// 		log.Err(err).Stack().Msg(err.Error())
-// 		return
-// 	}
-// 	log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
+func setupChunkServer(t *testing.T, root, address, masterAddress string) *chunkserver.ChunkServer {
+	assert.NotEmpty(t, root)
+	assert.NotEmpty(t, address)
+	assert.NotEmpty(t, masterAddress)
 
-// 	err = client.Write("/images/independent-day-101", common.Offset(0), data)
-// 	if err != nil {
-// 		log.Err(err).Stack().Msg(err.Error())
-// 		return
-// 	}
-// }
+	server, err := chunkserver.NewChunkServer(common.ServerAddr(address), common.ServerAddr(masterAddress), root)
+	require.NoError(t, err)
+	return server
+}
 
-// func TestAppendDataFromChunckServer(t *testing.T) {
-// 	addr := "127.0.0.1:9090"
-// 	client := NewClient(common.ServerAddr(addr), 30*time.Millisecond)
-// 	defer client.Close()
-// 	handle, err := client.GetChunkHandle("/images/independent-day-101", common.ChunkIndex(0))
-// 	if err != nil {
-// 		log.Err(err).Stack().Msg(err.Error())
-// 		return
-// 	}
-// 	log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
-// 	// err = client.Write("/images/independent-day-100", common.Offset(0), []byte("byte is done\n"))
-// 	// if err != nil {
-// 	// 	log.Err(err).Stack().Msg(err.Error())
-// 	// 	return
-// 	// }
+func populateServers(t *testing.T, client *HerculesClient) []common.ChunkHandle {
+	rand.NewSource(time.Now().UnixNano())
+	chunkHandles := []common.ChunkHandle{}
+	fake := faker.New()
 
-// 	// handle, err = client.GetChunkHandle("/images/independent-day-100", common.ChunkIndex(0))
-// 	// if err != nil {
-// 	// 	log.Err(err).Stack().Msg(err.Error())
-// 	// 	return
-// 	// }
-// 	// log.Info().Msg(fmt.Sprintf("Got a new handle : %v", handle))
+	for range 3 {
+		fakePath := fmt.Sprintf("/%s/%s/file-%d",
+			fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000))
 
-// 	_, err = client.Append("/images/independent-day-101", data)
-// 	if err != nil {
-// 		log.Err(err).Stack().Msg(err.Error())
-// 		return
-// 	}
+		handle, err := client.GetChunkHandle(common.Path(fakePath), 0)
+		require.NoError(t, err)
 
-// }
+		data := []byte(fake.Lorem().Paragraph(5))
+		n, err := client.Write(common.Path(fakePath), 0, data)
+		require.NoError(t, err)
+		require.Equal(t, len(data), n)
+		chunkHandles = append(chunkHandles, handle)
+	}
+
+	return chunkHandles
+}
+
+func TestHerculesClientIntegration(t *testing.T) {
+	ctx := t.Context()
+	dirPath := t.TempDir()
+
+	master := setupMasterServer(t, ctx, dirPath, "127.0.0.1:9090")
+
+	slaves := []*chunkserver.ChunkServer{}
+	for range 4 {
+		slave := setupChunkServer(t, t.TempDir(),
+			fmt.Sprintf("127.0.0.1:%d", 10000+rand.Intn(1000)), "127.0.0.1:9090")
+		slaves = append(slaves, slave)
+	}
+
+	defer func() {
+		for _, slave := range slaves {
+			assert.NoError(t, slave.Shutdown())
+		}
+		master.Shutdown()
+	}()
+
+	time.Sleep(2 * time.Second)
+	client := NewHerculesClient(ctx, "127.0.0.1:9090", 150*time.Millisecond)
+
+	populateServers(t, client)
+	time.Sleep(2 * time.Second)
+
+	type testcase struct {
+		name   string
+		doTest func(t *testing.T)
+	}
+
+	testCases := []testcase{
+		{
+			name: "WriteAndRead",
+			doTest: func(t *testing.T) {
+				fake := faker.New()
+				path := common.Path(fmt.Sprintf(
+					"/%s/%s/file-%d", fake.Music().Genre(),
+					fake.Music().Author(), rand.Intn(1000)))
+				data := []byte(fake.Lorem().Sentence(10))
+
+				handle, err := client.GetChunkHandle(common.Path(path), 0)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, int(handle), 0)
+				n, err := client.Write(path, 0, data)
+				assert.NoError(t, err)
+				assert.Equal(t, len(data), n)
+
+				readBuffer := make([]byte, len(data))
+				n, err = client.Read(path, 0, readBuffer)
+				assert.NoError(t, err)
+				assert.Equal(t, len(data), n)
+				assert.Equal(t, data, readBuffer)
+			},
+		},
+		// {
+		// 	name: "AppendAndRead",
+		// 	doTest: func(t *testing.T) {
+		// 		fake := faker.New()
+		// 		path := common.Path(fmt.Sprintf("/%s/%s/file-%d",
+		// 			fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000)))
+		// 		data := []byte(fake.Lorem().Sentence(5))
+
+		// 		handle, err := client.GetChunkHandle(common.Path(path), 0)
+		// 		require.NoError(t, err)
+		// 		require.GreaterOrEqual(t, int(handle), 0)
+
+		// 		offset, err := client.Append(path, data)
+		// 		assert.NoError(t, err)
+		// 		assert.Greater(t, int64(offset), int64(0))
+
+		// 		readBuffer := make([]byte, len(data))
+		// 		n, err := client.Read(path, offset-common.Offset(len(data)), readBuffer)
+		// 		assert.NoError(t, err)
+		// 		assert.Equal(t, len(data), n)
+		// 		assert.Equal(t, data, readBuffer)
+		// 	},
+		// },
+		{
+			name: "ListAndDelete",
+			doTest: func(t *testing.T) {
+				fake := faker.New()
+				dirPath := common.Path(fmt.Sprintf(
+					"/%s/%s", fake.Music().Genre(), fake.Music().Author()))
+				filePath := common.Path(fmt.Sprintf("%s/file-%d", dirPath, rand.Intn(1000)))
+
+				handle, err := client.GetChunkHandle(common.Path(filePath), 0)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, int(handle), 0)
+
+				entries, err := client.List(dirPath)
+				assert.NoError(t, err)
+				assert.GreaterOrEqual(t, len(entries), 1)
+
+				err = client.DeleteFile(filePath)
+				assert.NoError(t, err)
+
+				entries, err = client.List(dirPath)
+				assert.NoError(t, err)
+				assert.NotEmpty(t, entries)
+			},
+		},
+		// {
+		// 	name: "RenameFile",
+		// 	doTest: func(t *testing.T) {
+		// 		fake := faker.New()
+		// 		path := common.Path(fmt.Sprintf(
+		// 			"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
+		// 		newPath := common.Path(fmt.Sprintf(
+		// 			"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
+
+		// 		handle, err := client.GetChunkHandle(common.Path(path), 0)
+		// 		require.NoError(t, err)
+		// 		require.GreaterOrEqual(t, int(handle), 0)
+
+		// 		data := []byte(fake.Lorem().Sentence(5))
+		// 		n, err := client.Write(path, 0, data)
+		// 		assert.NoError(t, err)
+		// 		assert.Equal(t, len(data), n)
+
+		// 		err = client.RenameFile(path, newPath)
+		// 		assert.NoError(t, err)
+
+		// 		time.Sleep(5 * time.Second)
+		// 		readBuffer := make([]byte, len(data))
+		// 		n, err = client.Read(newPath, 0, readBuffer)
+		// 		assert.NoError(t, err)
+		// 		assert.Equal(t, len(data), n)
+		// 		assert.Equal(t, data, readBuffer)
+
+		// 		_, err = client.GetFile(path)
+		// 		assert.Error(t, err)
+		// 	},
+		// },
+		{
+			name: "LeaseManagement",
+			doTest: func(t *testing.T) {
+				fake := faker.New()
+				path := common.Path(fmt.Sprintf(
+					"/%s/%s/file-%d", fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000)))
+
+				handle, err := client.GetChunkHandle(path, 0)
+				assert.NoError(t, err)
+				lease, _, err := client.ObtainLease(handle, 0)
+				assert.NoError(t, err)
+				assert.NotEmpty(t, lease.Primary)
+				assert.False(t, lease.IsExpired(time.Now()))
+
+				time.Sleep(10 * time.Millisecond)
+				client.cacheMux.RLock()
+				_, exists := client.cache[handle]
+				client.cacheMux.RUnlock()
+				assert.True(t, exists, "Lease should still be in cache")
+			},
+		},
+	}
+
+	// Run test cases
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.doTest(t)
+		})
+	}
+}
+
+func TestMain(m *testing.M) {
+	rand.New(rand.NewSource(42))
+	m.Run()
+}
