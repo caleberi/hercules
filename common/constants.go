@@ -39,8 +39,8 @@ const (
 	AppendMaxSizeInByte   = ChunkMaxSizeInByte / 4
 
 	// downloadbuffer
-	DownloadBufferItemExpire = 60 * time.Second
-	DownloadBufferTick       = 15 * time.Second
+	DownloadBufferItemExpire = 10 * time.Second
+	DownloadBufferTick       = 10 * time.Second
 
 	// master server
 	ServerHealthCheckInterval time.Duration = 10 * time.Second
