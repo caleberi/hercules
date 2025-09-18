@@ -84,6 +84,7 @@ type ApplyMutationArgs struct {
 }
 
 type ApplyMutationReply struct {
+	Length    int
 	ErrorCode common.ErrorCode
 }
 
