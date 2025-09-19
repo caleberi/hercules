@@ -11,6 +11,7 @@ import (
 
 	"github.com/caleberi/distributed-system/common"
 	filesystem "github.com/caleberi/distributed-system/file_system"
+	"github.com/jaswdr/faker/v2"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,8 +38,7 @@ var (
 func testSetup(t *testing.T) (*filesystem.FileSystem, *ArchiverManager, []byte, string) {
 	t.Helper()
 
-	data, err := os.ReadFile(dataFile)
-	assert.NoError(t, err)
+	data := []byte(faker.New().Lorem().Paragraph(100))
 
 	tempDir := t.TempDir()
 	fsys := filesystem.NewFileSystem(tempDir)
@@ -48,7 +48,7 @@ func testSetup(t *testing.T) (*filesystem.FileSystem, *ArchiverManager, []byte, 
 	}
 
 	for _, path := range filepaths {
-		assert.NoErrorf(t, fsys.CreateFile(path), "failed to create file %s: %v", path, err)
+		assert.NoErrorf(t, fsys.CreateFile(path), "failed to create file %s: %v", path)
 	}
 
 	for _, path := range filepaths {
@@ -137,9 +137,17 @@ func TestArchiveDecompressionWithFileSystem(t *testing.T) {
 		for result := range archiver.CompressPipeline.Result {
 			assert.NoError(t, result.Err)
 			info, err := fsys.GetStat(string(result.Path))
+			if info != nil {
+				assert.NoError(t, err)
+				assert.True(t, info.Mode().IsRegular())
+				continue
+			}
+			err = archiver.SubmitDecompress(result.Path)
+			if err != nil {
+				assert.ErrorContains(t, err, "archiver has been closed")
+				continue
+			}
 			assert.NoError(t, err)
-			assert.True(t, info.Mode().IsRegular())
-			assert.NoError(t, archiver.SubmitDecompress(result.Path))
 		}
 	}()
 

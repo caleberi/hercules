@@ -32,12 +32,14 @@ type DecompressPipeline struct {
 }
 
 type ArchiverManager struct {
+	mu                 sync.Mutex
 	CompressPipeline   CompressPipeline
 	DecompressPipeline DecompressPipeline
 	fileSystem         *filesystem.FileSystem
 	ctx                context.Context
 	cancel             context.CancelFunc
 	wg                 sync.WaitGroup
+	isClosed           bool
 }
 
 func NewArchiver(fileSystem *filesystem.FileSystem, numWorkers int) *ArchiverManager {
@@ -213,11 +215,16 @@ func (ac *ArchiverManager) compress(path common.Path) (string, error) {
 }
 
 func (ac *ArchiverManager) Close() {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+
 	defer func() {
 		ac.cancel()
 
 		close(ac.CompressPipeline.Task)
 		close(ac.DecompressPipeline.Task)
+
+		ac.isClosed = true
 
 		ac.wg.Wait()
 
@@ -225,7 +232,6 @@ func (ac *ArchiverManager) Close() {
 		close(ac.DecompressPipeline.Result)
 	}()
 
-	timeout := time.After(10 * time.Second)
 	for {
 		compressLen := len(ac.CompressPipeline.Task)
 		decompressLen := len(ac.DecompressPipeline.Task)
@@ -233,33 +239,43 @@ func (ac *ArchiverManager) Close() {
 			break
 		}
 		select {
-		case <-timeout:
+		case <-time.After(10 * time.Second):
 			return
-		case <-time.After(100 * time.Millisecond):
-			continue
+		default:
 		}
 	}
 
 }
 func (ac *ArchiverManager) SubmitCompress(path common.Path) error {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	if ac.isClosed {
+		return errors.New("archiver has been closed")
+	}
 	select {
+	case <-ac.ctx.Done():
+		return errors.New("archiver is shutting down")
 	case ac.CompressPipeline.Task <- path:
 		return nil
 	case <-time.After(5 * time.Second):
 		return errors.New("timeout submitting compression task")
-	case <-ac.ctx.Done():
-		return errors.New("archiver is shutting down")
 	}
 }
 
 func (ac *ArchiverManager) SubmitDecompress(path common.Path) error {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	if ac.isClosed {
+		return errors.New("archiver has been closed")
+	}
 	select {
+	case <-ac.ctx.Done():
+		return errors.New("archiver is shutting down")
 	case ac.DecompressPipeline.Task <- path:
 		return nil
 	case <-time.After(5 * time.Second):
 		return errors.New("timeout submitting decompression task")
-	case <-ac.ctx.Done():
-		return errors.New("archiver is shutting down")
+
 	}
 }
 
