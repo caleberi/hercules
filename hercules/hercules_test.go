@@ -158,38 +158,38 @@ func TestHerculesClientIntegration(t *testing.T) {
 				assert.NotEmpty(t, entries)
 			},
 		},
-		// {
-		// 	name: "RenameFile",
-		// 	doTest: func(t *testing.T) {
-		// 		fake := faker.New()
-		// 		path := common.Path(fmt.Sprintf(
-		// 			"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
-		// 		newPath := common.Path(fmt.Sprintf(
-		// 			"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
+		{
+			name: "RenameFile",
+			doTest: func(t *testing.T) {
+				fake := faker.New()
+				path := common.Path(fmt.Sprintf(
+					"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
+				newPath := common.Path(fmt.Sprintf(
+					"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
 
-		// 		handle, err := client.GetChunkHandle(common.Path(path), 0)
-		// 		require.NoError(t, err)
-		// 		require.GreaterOrEqual(t, int(handle), 0)
+				handle, err := client.GetChunkHandle(common.Path(path), 0)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, int(handle), 0)
 
-		// 		data := []byte(fake.Lorem().Sentence(5))
-		// 		n, err := client.Write(path, 0, data)
-		// 		assert.NoError(t, err)
-		// 		assert.Equal(t, len(data), n)
+				data := []byte(fake.Lorem().Sentence(5))
+				n, err := client.Write(path, 0, data)
+				assert.NoError(t, err)
+				assert.Equal(t, len(data), n)
 
-		// 		err = client.RenameFile(path, newPath)
-		// 		assert.NoError(t, err)
+				err = client.RenameFile(path, newPath)
+				assert.NoError(t, err)
 
-		// 		time.Sleep(5 * time.Second)
-		// 		readBuffer := make([]byte, len(data))
-		// 		n, err = client.Read(newPath, 0, readBuffer)
-		// 		assert.NoError(t, err)
-		// 		assert.Equal(t, len(data), n)
-		// 		assert.Equal(t, data, readBuffer)
+				time.Sleep(5 * time.Second)
+				readBuffer := make([]byte, len(data))
+				n, err = client.Read(newPath, 0, readBuffer)
+				assert.NoError(t, err)
+				assert.Equal(t, len(data), n)
+				assert.Equal(t, data, readBuffer)
 
-		// 		_, err = client.GetFile(path)
-		// 		assert.Error(t, err)
-		// 	},
-		// },
+				_, err = client.GetFile(path)
+				assert.Error(t, err)
+			},
+		},
 		{
 			name: "LeaseManagement",
 			doTest: func(t *testing.T) {

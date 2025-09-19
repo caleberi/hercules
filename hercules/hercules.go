@@ -566,7 +566,6 @@ func (hercules *HerculesClient) Append(path common.Path, data []byte) (offset co
 	args := rpc_struct.GetFileInfoArgs{Path: path}
 	reply := rpc_struct.GetFileInfoReply{}
 
-	args.Path = path
 	err = shared.UnicastToRPCServer(string(hercules.master), rpc_struct.MRPCGetFileInfoHandler, args, &reply)
 	if err != nil {
 		return -1, err
@@ -643,12 +642,9 @@ func (hercules *HerculesClient) AppendChunk(handle common.ChunkHandle, data []by
 
 	if appendLease.Primary == "" {
 		appendLease.Primary = servers[0]
-		appendLease.Secondaries = servers[1:]
-	}
-	if len(servers) == 0 {
-		return offset, common.Error{Code: common.UnknownError, Err: "no replica"}
-	}
 
+	}
+	appendLease.Secondaries = servers[1:]
 	var errs []error
 	dataID := downloadbuffer.NewDownloadBufferId(handle)
 	utils.ForEach(servers, func(addr common.ServerAddr) {
