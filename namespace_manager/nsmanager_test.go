@@ -39,7 +39,7 @@ func treesAreEqual(tree1, tree2 *NsTree) bool {
 
 func TestNamespaceManager(t *testing.T) {
 	ctx := context.Background()
-	cleanupInterval := 3 * time.Second
+	cleanupInterval := 10 * time.Second
 
 	newManager := func() *NamespaceManager {
 		nm := NewNameSpaceManager(ctx, cleanupInterval)
@@ -161,7 +161,7 @@ func TestNamespaceManager(t *testing.T) {
 				setup: func(t *testing.T, nm *NamespaceManager) {
 					require.NoError(t, nm.MkDirAll(common.Path("/home/usr")), "Failed to create /home/usr")
 				},
-				shouldError: true,
+				shouldError: false,
 			},
 		}
 
