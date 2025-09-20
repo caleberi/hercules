@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,29 +112,32 @@ func TestHerculesClientIntegration(t *testing.T) {
 				assert.Equal(t, data, readBuffer)
 			},
 		},
-		// {
-		// 	name: "AppendAndRead",
-		// 	doTest: func(t *testing.T) {
-		// 		fake := faker.New()
-		// 		path := common.Path(fmt.Sprintf("/%s/%s/file-%d",
-		// 			fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000)))
-		// 		data := []byte(fake.Lorem().Sentence(5))
+		{
+			name: "AppendAndRead",
+			doTest: func(t *testing.T) {
+				fake := faker.New()
+				path := common.Path(fmt.Sprintf("/%s/%s/file-%d",
+					fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000)))
+				data := []byte(fake.Lorem().Sentence(5))
 
-		// 		handle, err := client.GetChunkHandle(common.Path(path), 0)
-		// 		require.NoError(t, err)
-		// 		require.GreaterOrEqual(t, int(handle), 0)
+				handle, err := client.GetChunkHandle(common.Path(path), 0)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, int(handle), 0)
+				n, err := client.Write(path, 0, data)
+				assert.NoError(t, err)
+				assert.Equal(t, len(data), n)
 
-		// 		offset, err := client.Append(path, data)
-		// 		assert.NoError(t, err)
-		// 		assert.Greater(t, int64(offset), int64(0))
+				data = []byte(strings.Join(fake.Lorem().Paragraphs(5), "\n"))
+				_, err = client.Append(path, data)
+				assert.NoError(t, err)
 
-		// 		readBuffer := make([]byte, len(data))
-		// 		n, err := client.Read(path, offset-common.Offset(len(data)), readBuffer)
-		// 		assert.NoError(t, err)
-		// 		assert.Equal(t, len(data), n)
-		// 		assert.Equal(t, data, readBuffer)
-		// 	},
-		// },
+				readBuffer := make([]byte, n+len(data))
+				n, err = client.Read(path, common.Offset(0), readBuffer)
+				assert.NoError(t, err)
+				assert.Equal(t, len(readBuffer), n)
+				assert.Contains(t, string(readBuffer), string(data))
+			},
+		},
 		{
 			name: "ListAndDelete",
 			doTest: func(t *testing.T) {
