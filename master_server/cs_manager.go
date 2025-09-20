@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -260,18 +259,10 @@ func (csm *ChunkServerManager) replicationMigration() []common.ChunkHandle {
 	csm.Lock()
 	defer csm.Unlock()
 
-	var newReplicationList []int
-
-	utils.ForEach(csm.replicaMigration, func(v common.ChunkHandle) {
-		if len(csm.chunks[v].locations) < common.MinimumReplicationFactor {
-			newReplicationList = append(newReplicationList, int(v))
-		}
-	})
-
-	sort.Ints(newReplicationList)
+	slices.Sort(csm.replicaMigration)
 	csm.replicaMigration = make([]common.ChunkHandle, 0)
 	for i, v := range csm.replicaMigration {
-		if i == 0 || v != common.ChunkHandle(newReplicationList[i-1]) { // avoid duplicate
+		if i == 0 || v != common.ChunkHandle(csm.replicaMigration[i-1]) { // avoid duplicate
 			csm.replicaMigration = append(csm.replicaMigration, common.ChunkHandle(v))
 		}
 	}
@@ -333,7 +324,7 @@ func (csm *ChunkServerManager) getLeaseHolder(handle common.ChunkHandle) (*commo
 
 				var reply rpc_struct.CheckChunkVersionReply
 
-				err := shared.UnicastToRPCServer(string(addr), "ChunkServer.RPCCheckChunkVersionHandler", arg, &reply)
+				err := shared.UnicastToRPCServer(string(addr), rpc_struct.CRPCCheckChunkVersionHandler, arg, &reply)
 				lock.Lock()
 				defer lock.Unlock()
 				if err != nil || reply.Stale {
@@ -382,7 +373,7 @@ func (csm *ChunkServerManager) getLeaseHolder(handle common.ChunkHandle) (*commo
 		args.Primary = lease.Primary
 		args.Secondaries = lease.Secondaries
 		args.Handle = lease.Handle
-		err := shared.UnicastToRPCServer(string(lease.Primary), "ChunkServer.RPCGrantLeaseHandler", args, &reply)
+		err := shared.UnicastToRPCServer(string(lease.Primary), rpc_struct.CRPCGrantLeaseHandler, args, &reply)
 		if err != nil {
 			log.Err(err).Stack().Send()
 			log.Warn().Msg(fmt.Sprintf("could not grant lease to primary = %v", chk.primary))
@@ -461,7 +452,9 @@ func (csm *ChunkServerManager) createChunk(path common.Path, addrs []common.Serv
 		path:   path,
 		expire: time.Now().Add(common.LeaseTimeout),
 	}
+	csm.chunkMutex.Lock()
 	csm.chunks[currentHandle] = chk // record the chunk on the master for later persistence
+	csm.chunkMutex.Unlock()
 
 	errs := []error{}
 	success := []string{}

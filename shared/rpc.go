@@ -2,51 +2,71 @@ package shared
 
 import (
 	"net/rpc"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
 
+// UnicastToRPCServer sends an RPC request to a single server with retries.
 func UnicastToRPCServer(addr string, method string, args any, reply any) error {
 	log.Info().Msgf("addr=%s method=%s", addr, method)
-	client, err := rpc.Dial("tcp", addr)
-	if err != nil {
-		if strings.Contains(err.Error(), "dial tcp: missing address") {
-			log.Info().Msgf("err=%s addr=%s method=%s args=%#v ", err.Error(), addr, method, args)
-		}
-		return err
-	}
-	defer client.Close()
-	err = client.Call(method, args, reply)
-	if err != nil {
-		return err
-	}
+	const maxRetries = 3
+	const retryDelay = 500 * time.Millisecond
 
-	return nil
+	var err error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		client, dialErr := rpc.Dial("tcp", addr)
+		if dialErr != nil {
+			log.Warn().Msgf("attempt %d: err=%s addr=%s method=%s args=%#v", attempt, dialErr.Error(), addr, method, args)
+			if attempt == maxRetries {
+				return dialErr
+			}
+			time.Sleep(retryDelay)
+			continue
+		}
+		defer client.Close()
+
+		err = client.Call(method, args, reply)
+		if err == nil {
+			return nil
+		}
+		log.Warn().Msgf("attempt %d: RPC call failed: err=%s addr=%s method=%s", attempt, err.Error(), addr, method)
+		if attempt == maxRetries {
+			return err
+		}
+		time.Sleep(retryDelay)
+	}
+	return err
 }
 
+// BroadcastToRPCServers sends an RPC request to multiple servers concurrently.
 func BroadcastToRPCServers(addrs []string, method string, args any, reply []any) []error {
 	var (
-		forEachIndexed = func(data []string, fn func(v string, idx int)) {
-			for i, dt := range data {
-				fn(dt, i)
-			}
-		}
-		wg = sync.WaitGroup{}
+		wg    = sync.WaitGroup{}
+		errs  = make([]error, len(addrs))
+		mutex = sync.Mutex{}
 	)
 
-	errs := make([]error, 0)
-	forEachIndexed(addrs, func(addr string, index int) {
+	for i, addr := range addrs {
 		wg.Add(1)
-		go func(wg *sync.WaitGroup) {
+		go func(idx int, addr string) {
 			defer wg.Done()
-			err := UnicastToRPCServer(addr, method, args, reply[index])
+			err := UnicastToRPCServer(addr, method, args, reply[idx])
 			if err != nil {
-				errs = append(errs, err)
+				mutex.Lock()
+				errs[idx] = err
+				mutex.Unlock()
 			}
-		}(&wg)
-	})
+		}(i, addr)
+	}
 	wg.Wait()
-	return errs
+
+	var filteredErrs []error
+	for _, err := range errs {
+		if err != nil {
+			filteredErrs = append(filteredErrs, err)
+		}
+	}
+	return filteredErrs
 }

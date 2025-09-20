@@ -22,4 +22,5 @@ const (
 	CRPCApplyMutationHandler     = "ChunkServer.RPCApplyMutationHandler"
 	CRPCApplyCopyHandler         = "ChunkServer.RPCApplyCopyHandler"
 	CRPCGetSnapshotHandler       = "ChunkServer.RPCGetSnapshotHandler"
+	CRPCGrantLeaseHandler        = "ChunkServer.RPCGrantLeaseHandler"
 )
