@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/caleberi/distributed-system/common"
@@ -16,61 +17,64 @@ import (
 type HerculesHTTPServer struct {
 	client *sdk.HerculesClient
 	server *http.Server
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex // Mutex to synchronize access to client
 }
 
 // NewHerculesHTTPServer creates a new HTTP server with the given HerculesClient.
-//
-// Parameters:
-//   - client: The HerculesClient instance to handle file operations.
-//
-// Returns:
-//   - A pointer to the initialized HerculesHTTPServer.
-func NewHerculesHTTPServer(client *sdk.HerculesClient) *HerculesHTTPServer {
+func NewHerculesHTTPServer(ctx context.Context, client *sdk.HerculesClient) *HerculesHTTPServer {
+	// Create a cancellable context for better control
+	ctx, cancel := context.WithCancel(ctx)
 	return &HerculesHTTPServer{
 		client: client,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 }
 
 // Start runs the HTTP server on the specified address, setting up routes for file operations.
-//
-// Parameters:
-//   - addr: The address (host:port) to bind the HTTP server to.
-//
-// Returns:
-//   - An error if the server fails to start.
 func (s *HerculesHTTPServer) Start(addr string) error {
 	r := gin.Default()
 
-	r.POST("/mkdir", s.handleMkDir)
-	r.POST("/create", s.handleCreateFile)
-	r.GET("/list/:path", s.handleList)
-	r.DELETE("/delete/:path", s.handleDeleteFile)
-	r.POST("/rename", s.handleRenameFile)
-	r.GET("/file/:path", s.handleGetFile)
-	r.GET("/read/:path", s.handleRead)
-	r.POST("/write/:path", s.handleWrite)
-	r.POST("/append/:path", s.handleAppend)
+	// Register handlers
+	r.POST("/get-handle", s.getChunkHandle)
+	// r.GET("/ls", s.handleList)
+	// r.DELETE("/delete/:path", s.handleDeleteFile)
+	// r.POST("/rename", s.handleRenameFile)
+	// r.GET("/file/:path", s.handleGetFile)
+	// r.GET("/read/:path", s.handleRead)
+	// r.POST("/write/:path", s.handleWrite)
+	// r.POST("/append/:path", s.handleAppend)
 
 	s.server = &http.Server{
 		Addr:    addr,
 		Handler: r,
 	}
 
-	return r.Run(addr)
+	// Start server in a goroutine to allow graceful shutdown
+	go func() {
+		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			// Log or handle error (e.g., send to a logger or channel)
+		}
+	}()
+
+	// Wait briefly to ensure server starts (useful for tests)
+	time.Sleep(100 * time.Millisecond)
+
+	return nil
 }
 
 // Close gracefully shuts down the HTTP server and the underlying HerculesClient.
-//
-// It stops accepting new requests, closes active connections, and cancels the client's context.
-// The method allows up to 5 seconds for connections to close gracefully.
-//
-// Returns:
-//   - An error if the server fails to shut down properly.
 func (s *HerculesHTTPServer) Close() error {
+	// Cancel the context to signal goroutines to stop
+	s.cancel()
+
 	if s.server == nil {
 		return nil
 	}
 
+	// Create a context with a timeout for shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -82,11 +86,37 @@ func (s *HerculesHTTPServer) Close() error {
 	return nil
 }
 
+// Shutdown gracefully shuts down the HTTP server for testing purposes.
+// It stops accepting new requests and waits for active connections to close.
+// Safe to call multiple times and from concurrent test goroutines.
+func (s *HerculesHTTPServer) Shutdown() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.server == nil {
+		return nil
+	}
+
+	// Cancel the context to signal goroutines to stop
+	s.cancel()
+
+	// Create a context with a timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := s.server.Shutdown(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Mark server as nil to prevent further shutdown attempts
+	s.server = nil
+
+	return nil
+}
+
 // handleMkDir handles HTTP POST requests to create a directory.
-//
-// It expects a JSON body with a "path" field specifying the directory path.
-// Returns a 200 OK response on success, or an error response (400 or 500) on failure.
-func (s *HerculesHTTPServer) handleMkDir(c *gin.Context) {
+func (s *HerculesHTTPServer) getChunkHandle(c *gin.Context) {
 	var req struct {
 		Path string `json:"path" binding:"required"`
 	}
@@ -95,19 +125,25 @@ func (s *HerculesHTTPServer) handleMkDir(c *gin.Context) {
 		return
 	}
 
-	err := s.client.MkDir(common.Path(req.Path))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	fileInfo, err := s.client.GetFile(common.Path(req.Path))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "directory created"})
+	handle, err := s.client.GetChunkHandle(common.Path(req.Path), common.ChunkIndex(fileInfo.Chunks))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "directory created", "handle": handle})
 }
 
 // handleCreateFile handles HTTP POST requests to create a file.
-//
-// It expects a JSON body with a "path" field specifying the file path.
-// Returns a 200 OK response on success, or an error response (400 or 500) on failure.
 func (s *HerculesHTTPServer) handleCreateFile(c *gin.Context) {
 	var req struct {
 		Path string `json:"path" binding:"required"`
@@ -116,6 +152,9 @@ func (s *HerculesHTTPServer) handleCreateFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	err := s.client.CreateFile(common.Path(req.Path))
 	if err != nil {
@@ -127,11 +166,13 @@ func (s *HerculesHTTPServer) handleCreateFile(c *gin.Context) {
 }
 
 // handleList handles HTTP GET requests to list directory contents.
-//
-// It expects a path parameter in the URL.
-// Returns a 200 OK response with the directory entries, or a 500 error on failure.
 func (s *HerculesHTTPServer) handleList(c *gin.Context) {
-	path := c.Param("path")
+	path := c.Query("path")
+
+	// Lock to ensure thread-safe access to client
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	entries, err := s.client.List(common.Path(path))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -142,11 +183,13 @@ func (s *HerculesHTTPServer) handleList(c *gin.Context) {
 }
 
 // handleDeleteFile handles HTTP DELETE requests to delete a file.
-//
-// It expects a path parameter in the URL.
-// Returns a 200 OK response on success, or a 500 error on failure.
 func (s *HerculesHTTPServer) handleDeleteFile(c *gin.Context) {
 	path := c.Param("path")
+
+	// Lock to ensure thread-safe access to client
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	err := s.client.DeleteFile(common.Path(path))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -157,9 +200,6 @@ func (s *HerculesHTTPServer) handleDeleteFile(c *gin.Context) {
 }
 
 // handleRenameFile handles HTTP POST requests to rename a file.
-//
-// It expects a JSON body with "source" and "target" fields specifying the old and new paths.
-// Returns a 200 OK response on success, or an error response (400 or 500) on failure.
 func (s *HerculesHTTPServer) handleRenameFile(c *gin.Context) {
 	var req struct {
 		Source string `json:"source" binding:"required"`
@@ -169,6 +209,10 @@ func (s *HerculesHTTPServer) handleRenameFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	// Lock to ensure thread-safe access to client
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	err := s.client.RenameFile(common.Path(req.Source), common.Path(req.Target))
 	if err != nil {
@@ -180,11 +224,13 @@ func (s *HerculesHTTPServer) handleRenameFile(c *gin.Context) {
 }
 
 // handleGetFile handles HTTP GET requests to retrieve file information.
-//
-// It expects a path parameter in the URL.
-// Returns a 200 OK response with file details (is_dir, length, chunks), or a 500 error on failure.
 func (s *HerculesHTTPServer) handleGetFile(c *gin.Context) {
 	path := c.Param("path")
+
+	// Lock to ensure thread-safe access to client
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	fileInfo, err := s.client.GetFile(common.Path(path))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -199,9 +245,6 @@ func (s *HerculesHTTPServer) handleGetFile(c *gin.Context) {
 }
 
 // handleRead handles HTTP GET requests to read data from a file.
-//
-// It expects a path parameter in the URL and query parameters "offset" and "length".
-// Returns the read data as binary content with a 200 OK response, or an error response (400 or 500) on failure.
 func (s *HerculesHTTPServer) handleRead(c *gin.Context) {
 	path := c.Param("path")
 	offsetStr := c.Query("offset")
@@ -220,6 +263,11 @@ func (s *HerculesHTTPServer) handleRead(c *gin.Context) {
 	}
 
 	data := make([]byte, length)
+
+	// Lock to ensure thread-safe access to client
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	n, err := s.client.Read(common.Path(path), common.Offset(offset), data)
 	if err != nil && err != io.EOF {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -230,9 +278,6 @@ func (s *HerculesHTTPServer) handleRead(c *gin.Context) {
 }
 
 // handleWrite handles HTTP POST requests to write data to a file.
-//
-// It expects a path parameter in the URL, an "offset" query parameter, and binary data in the request body.
-// Returns a 200 OK response with the number of bytes written, or an error response (400 or 500) on failure.
 func (s *HerculesHTTPServer) handleWrite(c *gin.Context) {
 	path := c.Param("path")
 	offsetStr := c.Query("offset")
@@ -249,6 +294,10 @@ func (s *HerculesHTTPServer) handleWrite(c *gin.Context) {
 		return
 	}
 
+	// Lock to ensure thread-safe access to client
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	n, err := s.client.Write(common.Path(path), common.Offset(offset), data)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -259,9 +308,6 @@ func (s *HerculesHTTPServer) handleWrite(c *gin.Context) {
 }
 
 // handleAppend handles HTTP POST requests to append data to a file.
-//
-// It expects a path parameter in the URL and binary data in the request body.
-// Returns a 200 OK response with the offset where data was appended, or an error response (400 or 500) on failure.
 func (s *HerculesHTTPServer) handleAppend(c *gin.Context) {
 	path := c.Param("path")
 	data, err := io.ReadAll(c.Request.Body)
@@ -269,6 +315,10 @@ func (s *HerculesHTTPServer) handleAppend(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
 		return
 	}
+
+	// Lock to ensure thread-safe access to client
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	offset, err := s.client.Append(common.Path(path), data)
 	if err != nil {

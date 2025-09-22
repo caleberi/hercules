@@ -93,7 +93,7 @@ func TestHerculesHTTPServerIntegration(t *testing.T) {
 	}()
 
 	client := hercules.NewHerculesClient(ctx, "127.0.0.1:9090", 150*time.Millisecond)
-	herculesHttpServer := NewHerculesHTTPServer(client)
+	herculesHttpServer := NewHerculesHTTPServer(ctx, client)
 
 	go func(addr string) {
 		err := herculesHttpServer.Start(addr)
@@ -114,17 +114,18 @@ func TestHerculesHTTPServerIntegration(t *testing.T) {
 		fake := faker.New()
 		dirPath := fmt.Sprintf("/%s/%s", fake.Music().Genre(), fake.Music().Name())
 		reqBody, _ := json.Marshal(map[string]string{"path": dirPath})
-		req := httptest.NewRequest(http.MethodPost, "/mkdir", bytes.NewReader(reqBody))
+		req := httptest.NewRequest(http.MethodPost, "/get-handle", bytes.NewReader(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-		var resp map[string]string
+		var resp map[string]any
 		err := json.Unmarshal(w.Body.Bytes(), &resp)
 		require.NoError(t, err, "Failed to unmarshal response")
 		assert.Equal(t, "directory created", resp["status"], "Expected directory created status")
+		assert.GreaterOrEqual(t, resp["handle"], 0)
 	})
 
 	// t.Run("CreateFile_Success", func(t *testing.T) {
@@ -147,7 +148,7 @@ func TestHerculesHTTPServerIntegration(t *testing.T) {
 	t.Run("List_Success", func(t *testing.T) {
 		fakeDirPath := path.Dir(paths[0]) // Get parent directory of a created file
 		encodedPath := url.PathEscape(fakeDirPath)
-		req := httptest.NewRequest(http.MethodGet, "/list/"+encodedPath, nil)
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/ls?path=%s", encodedPath), nil)
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
@@ -155,6 +156,8 @@ func TestHerculesHTTPServerIntegration(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
 		var resp map[string][]common.PathInfo
 		err := json.Unmarshal(w.Body.Bytes(), &resp)
+
+		log.Info().Msgf("Response : %v", resp)
 		require.NoError(t, err, "Failed to unmarshal response")
 		assert.NotEmpty(t, resp["entries"], "Expected non-empty entries")
 	})
