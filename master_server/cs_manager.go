@@ -631,12 +631,11 @@ func (csm *ChunkServerManager) UpdateFilePath(source common.Path, target common.
 	csm.chunkMutex.Lock()
 	defer csm.chunkMutex.Unlock()
 
-	if _, exists := csm.files[source]; !exists {
-		return fmt.Errorf("could not locate file with path = %s", source)
+	if _, exists := csm.files[source]; exists {
+		val := csm.files[source]
+		delete(csm.files, source)
+		csm.files[target] = val
 	}
 
-	val := csm.files[source]
-	delete(csm.files, source)
-	csm.files[target] = val
 	return nil
 }

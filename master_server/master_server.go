@@ -11,6 +11,7 @@ import (
 	"net/rpc"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -463,12 +464,12 @@ func (ma *MasterServer) RPCGetPrimaryAndSecondaryServersInfoHandler(
 func (ma *MasterServer) RPCGetChunkHandleHandler(
 	args rpc_struct.GetChunkHandleArgs,
 	reply *rpc_struct.GetChunkHandleReply) error {
-	dirpath, filename := ma.namespaceManager.RetrievePartitionFromPath(args.Path)
-	_, err := utils.ValidateFilenameStr(filename, args.Path)
+	filename := filepath.Base(string(args.Path))
+	err := utils.ValidateFilename(filename, args.Path)
 	if err != nil {
 		return err
 	}
-	err = ma.namespaceManager.MkDirAll(common.Path(dirpath))
+	err = ma.namespaceManager.MkDirAll(common.Path(args.Path))
 	if err != nil {
 		log.Err(err).Stack().Msg(err.Error())
 		return err
@@ -509,7 +510,6 @@ func (ma *MasterServer) RPCGetChunkHandleHandler(
 			return err
 		}
 	}
-
 	return err
 }
 
@@ -565,16 +565,17 @@ func (ma *MasterServer) RPCDeleteFileHandler(
 		return err
 	}
 
-	handles, err := ma.chunkServerManager.GetChunkHandles(args.Path)
-	if err != nil {
-		log.Err(err).Stack().Msg(err.Error())
-		return err
+	if args.DeleteHandle {
+		handles, err := ma.chunkServerManager.GetChunkHandles(args.Path)
+		if err != nil {
+			log.Err(err).Stack().Msg(err.Error())
+			return err
+		}
+
+		utils.ForEach(handles, func(handle common.ChunkHandle) {
+			ma.chunkServerManager.deleteChunk(handle)
+		})
 	}
-
-	utils.ForEach(handles, func(handle common.ChunkHandle) {
-		ma.chunkServerManager.deleteChunk(handle)
-	})
-
 	return nil
 }
 
