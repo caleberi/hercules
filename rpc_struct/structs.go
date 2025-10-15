@@ -163,7 +163,8 @@ type CreateFileArgs struct {
 type CreateFileReply struct{}
 
 type DeleteFileArgs struct {
-	Path common.Path
+	Path         common.Path
+	DeleteHandle bool
 }
 
 type DeleteFileReply struct{}
