@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"testing"
@@ -17,14 +19,13 @@ import (
 	"github.com/caleberi/distributed-system/common"
 	"github.com/caleberi/distributed-system/hercules"
 	"github.com/caleberi/distributed-system/master_server"
-	"github.com/gin-gonic/gin"
 	"github.com/jaswdr/faker/v2"
-	"github.com/rs/zerolog/log"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setupMasterServer(t *testing.T, ctx context.Context, root, address string) *master_server.MasterServer {
+func setupMasterServerForGateway(t *testing.T, ctx context.Context, root, address string) *master_server.MasterServer {
 	assert.NotEmpty(t, root)
 	assert.NotEmpty(t, address)
 
@@ -33,7 +34,7 @@ func setupMasterServer(t *testing.T, ctx context.Context, root, address string) 
 	return server
 }
 
-func setupChunkServer(t *testing.T, root, address, masterAddress string) *chunkserver.ChunkServer {
+func setupChunkServerForGateway(t *testing.T, root, address, masterAddress string) *chunkserver.ChunkServer {
 	assert.NotEmpty(t, root)
 	assert.NotEmpty(t, address)
 	assert.NotEmpty(t, masterAddress)
@@ -43,15 +44,15 @@ func setupChunkServer(t *testing.T, root, address, masterAddress string) *chunks
 	return server
 }
 
-func populateServers(t *testing.T, client *hercules.HerculesClient) ([]common.ChunkHandle, []string) {
+func populateGatewayTestData(t *testing.T, client *hercules.HerculesClient) ([]common.ChunkHandle, []string) {
 	chunkHandles := []common.ChunkHandle{}
 	paths := []string{}
 	fake := faker.New()
 
 	for i := range 3 {
-		genre := sanitizePathComponent(fake.Music().Genre())
-		artist := sanitizePathComponent(fake.Music().Author())
-		fakePath := fmt.Sprintf("/%s/%s/file-%d", genre, artist, i)
+		genre := sanitizePathForGateway(fake.Music().Genre())
+		artist := sanitizePathForGateway(fake.Music().Author())
+		fakePath := fmt.Sprintf("/%s/%s/file-%d.txt", genre, artist, i)
 
 		handle, err := client.GetChunkHandle(common.Path(fakePath), 0)
 		require.NoError(t, err, "Failed to get chunk handle for %s", fakePath)
@@ -60,28 +61,33 @@ func populateServers(t *testing.T, client *hercules.HerculesClient) ([]common.Ch
 		n, err := client.Write(common.Path(fakePath), 0, data)
 		require.NoError(t, err, "Failed to write to %s", fakePath)
 		require.Equal(t, len(data), n, "Write length mismatch for %s", fakePath)
+
 		chunkHandles = append(chunkHandles, handle)
 		paths = append(paths, fakePath)
 	}
 
 	return chunkHandles, paths
 }
-func sanitizePathComponent(s string) string {
+
+func sanitizePathForGateway(s string) string {
 	return strings.ReplaceAll(s, " ", "_")
 }
 
-func TestHerculesHTTPServerIntegration(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
+func TestHerculesHTTPGatewayIntegration(t *testing.T) {
 	ctx := t.Context()
+	masterDir := t.TempDir()
 
-	dirPath := t.TempDir()
+	masterAddr := "127.0.0.1:9091"
+	master := setupMasterServerForGateway(t, ctx, masterDir, masterAddr)
 
-	master := setupMasterServer(t, ctx, dirPath, "127.0.0.1:9090")
 	slaves := []*chunkserver.ChunkServer{}
 	for i := range 4 {
-		slave := setupChunkServer(t, t.TempDir(),
-			fmt.Sprintf("127.0.0.1:%d", 10000+i), "127.0.0.1:9090")
+		slave := setupChunkServerForGateway(
+			t,
+			t.TempDir(),
+			fmt.Sprintf("127.0.0.1:%d", 11000+i),
+			masterAddr,
+		)
 		slaves = append(slaves, slave)
 	}
 
@@ -92,170 +98,655 @@ func TestHerculesHTTPServerIntegration(t *testing.T) {
 		master.Shutdown()
 	}()
 
-	client := hercules.NewHerculesClient(ctx, "127.0.0.1:9090", 150*time.Millisecond)
-	herculesHttpServer := NewHerculesHTTPServer(ctx, client)
+	client := hercules.NewHerculesClient(ctx, common.ServerAddr(masterAddr), 150*time.Millisecond)
 
-	go func(addr string) {
-		err := herculesHttpServer.Start(addr)
-		if err != nil && err != http.ErrServerClosed {
-			log.Err(err).Msg("Failed to start HTTP server")
-		}
-	}(":8081")
+	config := DefaultGatewayConfig()
+	config.ServerName = "test-gateway"
+	config.Address = 8082
+	config.Logger = os.Stdout
+	config.EnableTLS = false
+	config.ReadTimeout = 10 * time.Second
+	config.WriteTimeout = 10 * time.Second
 
-	time.Sleep(5 * time.Second)
-	_, paths := populateServers(t, client)
+	gateway := NewHerculesHTTPGateway(ctx, client, config)
+	gateway.Start()
 
-	router := herculesHttpServer.server.Handler
-	if router == nil {
-		t.Fatal("server.Router is nil; ensure NewHerculesHTTPServer initializes Router field")
-	}
+	time.Sleep(2 * time.Second)
+
+	defer func() {
+		err := gateway.Shutdown()
+		assert.NoError(t, err, "Gateway shutdown failed")
+	}()
+
+	_, paths := populateGatewayTestData(t, client)
+	baseURL := "http://127.0.0.1:8082"
+
+	t.Run("Health_Check", func(t *testing.T) {
+		resp, err := http.Get(baseURL + "/health")
+		require.NoError(t, err, "Health check request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode health check response")
+		assert.Equal(t, "healthy", result["status"], "Expected healthy status")
+	})
 
 	t.Run("MkDir_Success", func(t *testing.T) {
 		fake := faker.New()
-		dirPath := fmt.Sprintf("/%s/%s", fake.Music().Genre(), fake.Music().Name())
+		dirPath := fmt.Sprintf("/%s/%s",
+			sanitizePathForGateway(fake.Music().Genre()),
+			sanitizePathForGateway(fake.Music().Name()))
+
 		reqBody, _ := json.Marshal(map[string]string{"path": dirPath})
-		req := httptest.NewRequest(http.MethodPost, "/get-handle", bytes.NewReader(reqBody))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
+		resp, err := http.Post(
+			baseURL+"/api/v1/mkdir",
+			"application/json",
+			bytes.NewReader(reqBody),
+		)
+		require.NoError(t, err, "MkDir request failed")
+		defer resp.Body.Close()
 
-		router.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
 
-		assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-		var resp map[string]any
-		err := json.Unmarshal(w.Body.Bytes(), &resp)
-		require.NoError(t, err, "Failed to unmarshal response")
-		assert.Equal(t, "directory created", resp["status"], "Expected directory created status")
-		assert.GreaterOrEqual(t, resp["handle"], 0)
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+		assert.Contains(t, result.Message, "Directory created", "Expected directory created message")
 	})
 
-	// t.Run("CreateFile_Success", func(t *testing.T) {
-	// 	fake := faker.New()
-	// 	fakePath := fmt.Sprintf("/%s/%s/file-create", fake.Music().Genre(), fake.Music().Name())
-	// 	reqBody, _ := json.Marshal(map[string]string{"path": fakePath})
-	// 	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(reqBody))
-	// 	req.Header.Set("Content-Type", "application/json")
-	// 	w := httptest.NewRecorder()
+	t.Run("CreateFile_Success", func(t *testing.T) {
+		fake := faker.New()
+		filePath := fmt.Sprintf("/%s/%s/test-file.txt",
+			sanitizePathForGateway(fake.Music().Genre()),
+			sanitizePathForGateway(fake.Music().Name()))
 
-	// 	router.ServeHTTP(w, req)
+		reqBody, _ := json.Marshal(map[string]string{"path": filePath})
+		resp, err := http.Post(
+			baseURL+"/api/v1/create",
+			"application/json",
+			bytes.NewReader(reqBody),
+		)
+		require.NoError(t, err, "CreateFile request failed")
+		defer resp.Body.Close()
 
-	// 	assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-	// 	var resp map[string]string
-	// 	err := json.Unmarshal(w.Body.Bytes(), &resp)
-	// 	require.NoError(t, err, "Failed to unmarshal response")
-	// 	assert.Equal(t, "file created", resp["status"], "Expected file created status")
-	// })
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.Truef(t, result.Success, "Expected success=true,%v", err)
+		assert.Contains(t, result.Message, "File created", "Expected file created message")
+	})
 
 	t.Run("List_Success", func(t *testing.T) {
-		fakeDirPath := path.Dir(paths[0]) // Get parent directory of a created file
-		encodedPath := url.PathEscape(fakeDirPath)
-		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/ls?path=%s", encodedPath), nil)
-		w := httptest.NewRecorder()
+		if len(paths) == 0 {
+			t.Skip("No paths available for listing")
+		}
 
-		router.ServeHTTP(w, req)
+		dirPath := path.Dir(paths[0])
+		encodedPath := url.QueryEscape(dirPath)
 
-		assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-		var resp map[string][]common.PathInfo
-		err := json.Unmarshal(w.Body.Bytes(), &resp)
+		resp, err := http.Get(fmt.Sprintf("%s/api/v1/list?path=%s", baseURL, encodedPath))
+		require.NoError(t, err, "List request failed")
+		defer resp.Body.Close()
 
-		log.Info().Msgf("Response : %v", resp)
-		require.NoError(t, err, "Failed to unmarshal response")
-		assert.NotEmpty(t, resp["entries"], "Expected non-empty entries")
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+
+		data, ok := result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
+
+		entries, ok := data["entries"]
+		require.True(t, ok, "Expected entries field in response")
+		assert.NotNil(t, entries, "Expected non-nil entries")
 	})
 
-	// t.Run("DeleteFile_Success", func(t *testing.T) {
-	// 	fake := faker.New()
-	// 	fakePath := fmt.Sprintf("/%s/%s/file-0", fake.Music().Genre(), fake.Music().Name())
-	// 	req := httptest.NewRequest(http.MethodDelete, "/delete"+fakePath, nil)
-	// 	w := httptest.NewRecorder()
+	t.Run("GetFileInfo_Success", func(t *testing.T) {
+		if len(paths) == 0 {
+			t.Skip("No paths available for file info")
+		}
 
-	// 	router.ServeHTTP(w, req)
+		filePath := paths[0]
+		encodedPath := url.QueryEscape(filePath)
 
-	// 	assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-	// 	var resp map[string]string
-	// 	err := json.Unmarshal(w.Body.Bytes(), &resp)
-	// 	require.NoError(t, err, "Failed to unmarshal response")
-	// 	assert.Equal(t, "file deleted", resp["status"], "Expected file deleted status")
-	// })
+		resp, err := http.Get(fmt.Sprintf("%s/api/v1/fileinfo?path=%s", baseURL, encodedPath))
+		require.NoError(t, err, "GetFileInfo request failed")
+		defer resp.Body.Close()
 
-	// t.Run("RenameFile_Success", func(t *testing.T) {
-	// 	fake := faker.New()
-	// 	genre := fake.Music().Genre()
-	// .Name := fake.Music().Name()
-	// 	sourcePath := fmt.Sprintf("/%s/%s/file-1", genre,.Name)
-	// 	targetPath := fmt.Sprintf("/%s/%s/renamed-file", genre,.Name)
-	// 	reqBody, _ := json.Marshal(map[string]string{"source": sourcePath, "target": targetPath})
-	// 	req := httptest.NewRequest(http.MethodPost, "/rename", bytes.NewReader(reqBody))
-	// 	req.Header.Set("Content-Type", "application/json")
-	// 	w := httptest.NewRecorder()
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
 
-	// 	router.ServeHTTP(w, req)
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
 
-	// 	assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-	// 	var resp map[string]string
-	// 	err := json.Unmarshal(w.Body.Bytes(), &resp)
-	// 	require.NoError(t, err, "Failed to unmarshal response")
-	// 	assert.Equal(t, "file renamed", resp["status"], "Expected file renamed status")
-	// })
+		data, ok := result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
 
-	// t.Run("GetFile_Success", func(t *testing.T) {
-	// 	fake := faker.New()
-	// 	fakePath := fmt.Sprintf("/%s/%s/file-2", fake.Music().Genre(), fake.Music().Name())
-	// 	req := httptest.NewRequest(http.MethodGet, "/file"+fakePath, nil)
-	// 	w := httptest.NewRecorder()
+		_, hasIsDir := data["is_dir"]
+		_, hasLength := data["length"]
+		_, hasChunks := data["chunks"]
 
-	// 	router.ServeHTTP(w, req)
+		assert.True(t, hasIsDir, "Expected is_dir field")
+		assert.True(t, hasLength, "Expected length field")
+		assert.True(t, hasChunks, "Expected chunks field")
+	})
 
-	// 	assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-	// 	var resp map[string]interface{}
-	// 	err := json.Unmarshal(w.Body.Bytes(), &resp)
-	// 	require.NoError(t, err, "Failed to unmarshal response")
-	// 	assert.False(t, resp["is_dir"].(bool), "Expected is_dir to be false")
-	// 	assert.Greater(t, resp["length"].(float64), float64(0), "Expected file length > 0")
-	// })
+	t.Run("Write_Success", func(t *testing.T) {
+		if len(paths) == 0 {
+			t.Skip("No paths available for writing")
+		}
 
-	// t.Run("Read_Success", func(t *testing.T) {
-	// 	fake := faker.New()
-	// 	fakePath := fmt.Sprintf("/%s/%s/file-2", fake.Music().Genre(), fake.Music().Name())
-	// 	req := httptest.NewRequest(http.MethodGet, "/read"+fakePath+"?offset=0&length=100", nil)
-	// 	w := httptest.NewRecorder()
+		filePath := paths[0]
+		testData := []byte("Hello from HTTP Gateway test!")
 
-	// 	router.ServeHTTP(w, req)
+		reqURL := fmt.Sprintf("%s/api/v1/write?path=%s&offset=0",
+			baseURL,
+			url.QueryEscape(filePath))
 
-	// 	assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-	// 	assert.NotEmpty(t, w.Body.String(), "Expected non-empty response body")
-	// })
+		resp, err := http.Post(reqURL, "application/octet-stream", bytes.NewReader(testData))
+		require.NoError(t, err, "Write request failed")
+		defer resp.Body.Close()
 
-	// t.Run("Write_Success", func(t *testing.T) {
-	// 	fake := faker.New()
-	// 	fakePath := fmt.Sprintf("/%s/%s/file-2", fake.Music().Genre(), fake.Music().Name())
-	// 	data := []byte(fake.Lorem().Sentence(5))
-	// 	req := httptest.NewRequest(http.MethodPost, "/write"+fakePath+"?offset=0", bytes.NewReader(data))
-	// 	w := httptest.NewRecorder()
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
 
-	// 	router.ServeHTTP(w, req)
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
 
-	// 	assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-	// 	var resp map[string]int
-	// 	err := json.Unmarshal(w.Body.Bytes(), &resp)
-	// 	require.NoError(t, err, "Failed to unmarshal response")
-	// 	assert.Equal(t, len(data), resp["bytes_written"], "Expected bytes_written to match data length")
-	// })
+		data, ok := result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
 
-	// t.Run("Append_Success", func(t *testing.T) {
-	// 	fake := faker.New()
-	// 	fakePath := fmt.Sprintf("/%s/%s/file-2", fake.Music().Genre(), fake.Music().Name())
-	// 	data := []byte(fake.Lorem().Sentence(5))
-	// 	req := httptest.NewRequest(http.MethodPost, "/append"+fakePath, bytes.NewReader(data))
-	// 	w := httptest.NewRecorder()
+		bytesWritten, ok := data["bytes_written"].(float64)
+		require.True(t, ok, "Expected bytes_written field")
+		assert.Equal(t, float64(len(testData)), bytesWritten, "Bytes written mismatch")
+	})
 
-	// 	router.ServeHTTP(w, req)
+	t.Run("Read_Success", func(t *testing.T) {
+		if len(paths) == 0 {
+			t.Skip("No paths available for reading")
+		}
 
-	// 	assert.Equal(t, http.StatusOK, w.Code, "Expected HTTP 200 OK")
-	// 	var resp map[string]int64
-	// 	err := json.Unmarshal(w.Body.Bytes(), &resp)
-	// 	require.NoError(t, err, "Failed to unmarshal response")
-	// 	assert.GreaterOrEqual(t, resp["offset"], int64(0), "Expected offset >= 0")
-	// })
+		filePath := paths[0]
+		reqURL := fmt.Sprintf("%s/api/v1/read?path=%s&offset=0&length=100",
+			baseURL,
+			url.QueryEscape(filePath))
 
-	herculesHttpServer.Close()
+		resp, err := http.Get(reqURL)
+		require.NoError(t, err, "Read request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+		assert.Equal(t, "application/octet-stream", resp.Header.Get("Content-Type"))
+
+		data, err := io.ReadAll(resp.Body)
+		require.NoError(t, err, "Failed to read response body")
+		assert.NotEmpty(t, data, "Expected non-empty response body")
+	})
+
+	t.Run("Append_Success", func(t *testing.T) {
+		if len(paths) == 0 {
+			t.Skip("No paths available for appending")
+		}
+
+		filePath := paths[0]
+		appendData := []byte(" Appended data!")
+
+		reqURL := fmt.Sprintf("%s/api/v1/append?path=%s",
+			baseURL,
+			url.QueryEscape(filePath))
+
+		resp, err := http.Post(reqURL, "application/octet-stream", bytes.NewReader(appendData))
+		require.NoError(t, err, "Append request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+
+		data, ok := result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
+
+		offset, ok := data["offset"]
+		require.True(t, ok, "Expected offset field")
+		assert.NotNil(t, offset, "Expected non-nil offset")
+	})
+
+	t.Run("GetChunkHandle_Success", func(t *testing.T) {
+		if len(paths) == 0 {
+			t.Skip("No paths available for chunk handle")
+		}
+
+		filePath := paths[0]
+		reqURL := fmt.Sprintf("%s/api/v1/chunk/handle?path=%s&index=0",
+			baseURL,
+			url.QueryEscape(filePath))
+
+		resp, err := http.Get(reqURL)
+		require.NoError(t, err, "GetChunkHandle request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+
+		data, ok := result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
+
+		handle, ok := data["handle"]
+		require.True(t, ok, "Expected handle field")
+		assert.NotNil(t, handle, "Expected non-nil handle")
+	})
+
+	t.Run("GetChunkServers_Success", func(t *testing.T) {
+		if len(paths) == 0 {
+			t.Skip("No paths available for chunk servers")
+		}
+
+		filePath := paths[0]
+		handle, err := client.GetChunkHandle(common.Path(filePath), 0)
+		require.NoError(t, err, "Failed to get chunk handle")
+
+		reqURL := fmt.Sprintf("%s/api/v1/chunk/servers?handle=%d", baseURL, handle)
+
+		resp, err := http.Get(reqURL)
+		require.NoError(t, err, "GetChunkServers request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+
+		data, ok := result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
+
+		primary, hasPrimary := data["primary"]
+		secondaries, hasSecondaries := data["secondaries"]
+
+		assert.True(t, hasPrimary, "Expected primary field")
+		assert.True(t, hasSecondaries, "Expected secondaries field")
+		assert.NotNil(t, primary, "Expected non-nil primary")
+		assert.NotNil(t, secondaries, "Expected non-nil secondaries")
+	})
+
+	t.Run("RenameFile_Success", func(t *testing.T) {
+		fake := faker.New()
+		genre := sanitizePathForGateway(fake.Music().Genre())
+		name := sanitizePathForGateway(fake.Music().Name())
+
+		sourcePath := fmt.Sprintf("/%s/%s/original.txt", genre, name)
+		targetPath := fmt.Sprintf("/%s/%s/renamed.txt", genre, name)
+
+		createBody, _ := json.Marshal(map[string]string{"path": sourcePath})
+		createResp, err := http.Post(
+			baseURL+"/api/v1/create",
+			"application/json",
+			bytes.NewReader(createBody),
+		)
+		require.NoError(t, err, "Failed to create source file")
+		assert.Equal(t, http.StatusOK, createResp.StatusCode, "Expected HTTP 200 OK")
+		createResp.Body.Close()
+
+		encodedPath := url.QueryEscape(".")
+
+		resp, err := http.Get(fmt.Sprintf("%s/api/v1/list?path=%s", baseURL, encodedPath))
+		require.NoError(t, err, "List request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+
+		data, ok := result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
+
+		entries, ok := data["entries"]
+		log.Printf("entries: \n %v\n", entries)
+		require.True(t, ok, "Expected entries field in response")
+		assert.NotNil(t, entries, "Expected non-nil entries")
+
+		// time.Sleep(10 * time.Millisecond)
+		renameBody, _ := json.Marshal(map[string]string{
+			"source": sourcePath,
+			"target": targetPath,
+		})
+
+		resp, err = http.Post(
+			baseURL+"/api/v1/rename",
+			"application/json",
+			bytes.NewReader(renameBody),
+		)
+		require.NoError(t, err, "Rename request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		// var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+		assert.Contains(t, result.Message, "renamed", "Expected rename message")
+
+		resp, err = http.Get(fmt.Sprintf("%s/api/v1/list?path=%s", baseURL, encodedPath))
+		require.NoError(t, err, "List request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+
+		data, ok = result.Data.(map[string]any)
+		require.True(t, ok, "Expected data to be a map")
+
+		entries, ok = data["entries"]
+		log.Printf("entries: \n %v\n", entries)
+		require.True(t, ok, "Expected entries field in response")
+		assert.NotNil(t, entries, "Expected non-nil entries")
+
+	})
+
+	t.Run("DeleteFile_Success", func(t *testing.T) {
+		fake := faker.New()
+		filePath := fmt.Sprintf("/%s/%s/to-delete.txt",
+			sanitizePathForGateway(fake.Music().Genre()),
+			sanitizePathForGateway(fake.Music().Name()))
+
+		createBody, _ := json.Marshal(map[string]string{"path": filePath})
+		createResp, err := http.Post(
+			baseURL+"/api/v1/create",
+			"application/json",
+			bytes.NewReader(createBody),
+		)
+		require.NoError(t, err, "Failed to create file for deletion")
+		createResp.Body.Close()
+
+		deleteBody, _ := json.Marshal(map[string]string{"path": filePath})
+		req, err := http.NewRequest(
+			http.MethodDelete,
+			baseURL+"/api/v1/delete",
+			bytes.NewReader(deleteBody),
+		)
+		require.NoError(t, err, "Failed to create delete request")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err, "Delete request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+
+		var result SuccessResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode response")
+		assert.True(t, result.Success, "Expected success=true")
+		assert.Contains(t, result.Message, "deleted", "Expected delete message")
+	})
+
+	t.Run("Error_PathRequired", func(t *testing.T) {
+		reqBody, _ := json.Marshal(map[string]string{"path": ""})
+		resp, err := http.Post(
+			baseURL+"/api/v1/mkdir",
+			"application/json",
+			bytes.NewReader(reqBody),
+		)
+		require.NoError(t, err, "Request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "Expected HTTP 400 Bad Request")
+
+		var result ErrorResponse
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		require.NoError(t, err, "Failed to decode error response")
+		assert.NotEmpty(t, result.Error, "Expected error message")
+	})
+
+	t.Run("Error_MethodNotAllowed", func(t *testing.T) {
+		resp, err := http.Get(baseURL + "/api/v1/mkdir")
+		require.NoError(t, err, "Request failed")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode, "Expected HTTP 405 Method Not Allowed")
+	})
+}
+
+func BenchmarkGatewayWrite(b *testing.B) {
+	ctx := context.Background()
+	masterDir := b.TempDir()
+	masterAddr := "127.0.0.1:9092"
+
+	master := master_server.NewMasterServer(ctx, common.ServerAddr(masterAddr), masterDir)
+	defer master.Shutdown()
+
+	slaves := []*chunkserver.ChunkServer{}
+	for i := range 4 {
+		slave, err := chunkserver.NewChunkServer(
+			common.ServerAddr(fmt.Sprintf("127.0.0.1:%d", 12000+i)),
+			common.ServerAddr(masterAddr),
+			b.TempDir(),
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		slaves = append(slaves, slave)
+	}
+	defer func() {
+		for _, slave := range slaves {
+			slave.Shutdown()
+		}
+	}()
+
+	client := hercules.NewHerculesClient(ctx, common.ServerAddr(masterAddr), 150*time.Millisecond)
+
+	config := DefaultGatewayConfig()
+	config.Address = 8083
+	config.Logger = zerolog.Nop()
+
+	gateway := NewHerculesHTTPGateway(ctx, client, config)
+	gateway.Start()
+	defer gateway.Shutdown()
+
+	time.Sleep(2 * time.Second)
+
+	baseURL := "http://127.0.0.1:8083"
+	testData := bytes.Repeat([]byte("test"), 256)
+
+	b.Logf("Creating %d test files and getting chunk handles...", b.N)
+	for i := 0; b.Loop(); i++ {
+		filePath := fmt.Sprintf("/bench/file-%d.txt", i)
+
+		handle, err := client.GetChunkHandle(common.Path(filePath), 0)
+		if err != nil {
+			b.Fatalf("Failed to get chunk handle for %s: %v", filePath, err)
+		}
+
+		if handle < 0 {
+			b.Fatalf("Invalid chunk handle %d for file %s", handle, filePath)
+		}
+	}
+	b.Logf("File creation and chunk handle retrieval complete")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; b.Loop(); i++ {
+		filePath := fmt.Sprintf("/bench/file-%d.txt", i)
+		reqURL := fmt.Sprintf("%s/api/v1/write?path=%s&offset=0", baseURL, url.QueryEscape(filePath))
+
+		resp, err := http.Post(reqURL, "application/octet-stream", bytes.NewReader(testData))
+		if err != nil {
+			b.Fatalf("Write failed: %v", err)
+		}
+		resp.Body.Close()
+	}
+}
+
+func BenchmarkGatewayRead(b *testing.B) {
+	ctx := context.Background()
+	masterDir := b.TempDir()
+	masterAddr := "127.0.0.1:9093"
+
+	master := master_server.NewMasterServer(ctx, common.ServerAddr(masterAddr), masterDir)
+	defer master.Shutdown()
+
+	slaves := []*chunkserver.ChunkServer{}
+	for i := range 4 {
+		slave, err := chunkserver.NewChunkServer(
+			common.ServerAddr(fmt.Sprintf("127.0.0.1:%d", 13000+i)),
+			common.ServerAddr(masterAddr),
+			b.TempDir(),
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		slaves = append(slaves, slave)
+	}
+	defer func() {
+		for _, slave := range slaves {
+			slave.Shutdown()
+		}
+	}()
+
+	client := hercules.NewHerculesClient(ctx, common.ServerAddr(masterAddr), 150*time.Millisecond)
+
+	config := DefaultGatewayConfig()
+	config.Address = 8084
+	config.Logger = zerolog.Nop()
+
+	gateway := NewHerculesHTTPGateway(ctx, client, config)
+	gateway.Start()
+	defer gateway.Shutdown()
+
+	time.Sleep(2 * time.Second)
+
+	baseURL := "http://127.0.0.1:8084"
+	testData := bytes.Repeat([]byte("benchmark data "), 64) // 1KB of data
+
+	b.Logf("Creating and populating %d test files...", b.N)
+	for i := 0; b.Loop(); i++ {
+		filePath := fmt.Sprintf("/bench-read/file-%d.txt", i)
+
+		handle, err := client.GetChunkHandle(common.Path(filePath), 0)
+		if err != nil {
+			b.Fatalf("Failed to get chunk handle: %v", err)
+		}
+		if handle < 0 {
+			b.Fatalf("Invalid chunk handle %d", handle)
+		}
+
+		n, err := client.Write(common.Path(filePath), 0, testData)
+		if err != nil {
+			b.Fatalf("Failed to write file: %v", err)
+		}
+		if n != len(testData) {
+			b.Fatalf("Write size mismatch: expected %d, got %d", len(testData), n)
+		}
+	}
+	b.Logf("File population complete")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; b.Loop(); i++ {
+		filePath := fmt.Sprintf("/bench-read/file-%d.txt", i)
+		reqURL := fmt.Sprintf("%s/api/v1/read?path=%s&offset=0&length=1024",
+			baseURL,
+			url.QueryEscape(filePath))
+
+		resp, err := http.Get(reqURL)
+		if err != nil {
+			b.Fatalf("Read failed: %v", err)
+		}
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+}
+
+func BenchmarkGatewayAppend(b *testing.B) {
+	ctx := context.Background()
+	masterDir := b.TempDir()
+	masterAddr := "127.0.0.1:9094"
+
+	master := master_server.NewMasterServer(ctx, common.ServerAddr(masterAddr), masterDir)
+	defer master.Shutdown()
+
+	slaves := []*chunkserver.ChunkServer{}
+	for i := range 4 {
+		slave, err := chunkserver.NewChunkServer(
+			common.ServerAddr(fmt.Sprintf("127.0.0.1:%d", 14000+i)),
+			common.ServerAddr(masterAddr),
+			b.TempDir(),
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		slaves = append(slaves, slave)
+	}
+	defer func() {
+		for _, slave := range slaves {
+			slave.Shutdown()
+		}
+	}()
+
+	client := hercules.NewHerculesClient(ctx, common.ServerAddr(masterAddr), 150*time.Millisecond)
+
+	config := DefaultGatewayConfig()
+	config.Address = 8085
+	config.Logger = zerolog.Nop()
+
+	gateway := NewHerculesHTTPGateway(ctx, client, config)
+	gateway.Start()
+	defer gateway.Shutdown()
+
+	time.Sleep(2 * time.Second)
+
+	baseURL := "http://127.0.0.1:8085"
+	appendData := []byte("appended data\n")
+
+	filePath := "/bench-append/shared-file.txt"
+
+	handle, err := client.GetChunkHandle(common.Path(filePath), 0)
+	if err != nil {
+		b.Fatalf("Failed to get chunk handle: %v", err)
+	}
+	if handle < 0 {
+		b.Fatalf("Invalid chunk handle %d", handle)
+	}
+
+	b.Logf("File created with chunk handle %d", handle)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		reqURL := fmt.Sprintf("%s/api/v1/append?path=%s", baseURL, url.QueryEscape(filePath))
+
+		resp, err := http.Post(reqURL, "application/octet-stream", bytes.NewReader(appendData))
+		if err != nil {
+			b.Fatalf("Append failed: %v", err)
+		}
+		resp.Body.Close()
+	}
 }
