@@ -171,14 +171,13 @@ func ComputeChecksum(content string) string {
 	return hex.EncodeToString(checksum)
 }
 
-func ValidateFilenameStr(filename string, p common.Path) (bool, error) {
-	switch filename {
-	case "", ".", "..":
-		return true, fmt.Errorf("path %s does not have a base file", p)
-	default:
-		break
+// ValidateFilename checks if the given filename is valid for use in the namespace.
+// It returns an error if the filename is empty or a reserved name like "." or "..".
+func ValidateFilename(filename string, path common.Path) error {
+	if filename == "" || filename == "." || filename == ".." {
+		return fmt.Errorf("invalid filename %q for path %s: reserved or empty name", filename, path)
 	}
-	return false, nil
+	return nil
 }
 
 // BToMb converts bytes to megabytes with floating-point precision.
