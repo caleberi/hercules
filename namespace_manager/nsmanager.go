@@ -2,7 +2,10 @@ package namespacemanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -34,20 +37,6 @@ type NsTree struct {
 }
 
 // NamespaceManager manages the namespace tree for a distributed file system.
-// It supports operations like file/directory creation, deletion, renaming, and listing,
-// with thread-safe access using read-write locks. It also handles serialization for persistence
-// and periodic cleanup of deleted nodes.
-//
-// Since the namespace can have many nodes, read-write lock
-// objects are allocated lazily and deleted once they are not in
-// use. Also, locks are acquired in a consistent total order
-// to prevent deadlock: they are first ordered by level in the
-// namespace tree and lexicographically within the same level.
-//
-// The read lock on the directory name suffices to prevent the directory from
-// being deleted, renamed, or snapshotted. The write locks on
-// file names serialize attempts to create a file with the same (ensure linear-lity)
-// name twice.
 type NamespaceManager struct {
 	root                 *NsTree             // Root of the namespace tree
 	serializationCount   int                 // Counter for serialization operations
@@ -61,8 +50,6 @@ type NamespaceManager struct {
 }
 
 // NewNameSpaceManager creates a new NamespaceManager with the specified cleanup interval.
-// It initializes the root node as a directory and starts a background goroutine for periodic cleanup.
-// The cleanup removes nodes marked as deleted from the namespace tree.
 func NewNameSpaceManager(ctx context.Context, cleanUpInterval time.Duration) *NamespaceManager {
 	nctx, cancelFunc := context.WithCancel(ctx)
 	nm := &NamespaceManager{
@@ -75,6 +62,7 @@ func NewNameSpaceManager(ctx context.Context, cleanUpInterval time.Duration) *Na
 		},
 		cleanUpInterval: cleanUpInterval,
 		deleteCache:     make(map[string]struct{}),
+		cleanupChan:     make(chan string, 100), // FIX: Initialize the channel
 	}
 
 	go func(nm *NamespaceManager) {
@@ -88,9 +76,7 @@ func NewNameSpaceManager(ctx context.Context, cleanUpInterval time.Duration) *Na
 				if err != nil {
 					continue
 				}
-				cwd.Lock()
 				delete(cwd.childrenNodes, filename)
-				cwd.Unlock()
 				nm.unlockParents(parents, true)
 
 				nm.mu.Lock()
@@ -122,9 +108,7 @@ func NewNameSpaceManager(ctx context.Context, cleanUpInterval time.Duration) *Na
 }
 
 // SliceToNsTree converts a slice of serialized nodes into an NsTree, starting from the specified index.
-// It recursively reconstructs the tree structure during deserialization.
 func (nm *NamespaceManager) SliceToNsTree(r []SerializedNsTreeNode, id int) *NsTree {
-
 	n := &NsTree{
 		Path:   r[id].Path,
 		Chunks: r[id].Chunks,
@@ -135,28 +119,12 @@ func (nm *NamespaceManager) SliceToNsTree(r []SerializedNsTreeNode, id int) *NsT
 		for k, child := range r[id].Children {
 			n.childrenNodes[k] = nm.SliceToNsTree(r, child)
 		}
-	} else {
-		nextId := id - 1
-		if nextId < 0 {
-			return n
-		}
-		parent := nm.SliceToNsTree(r, nextId)
-		if parent != nil {
-			if parent.childrenNodes != nil {
-				parent.childrenNodes[string(r[id].Path)] = n
-			} else {
-				parent.childrenNodes = make(map[string]*NsTree)
-				parent.childrenNodes[string(r[id].Path)] = n
-			}
-
-		}
 	}
 	nm.deserializationCount++
 	return n
 }
 
 // Deserialize reconstructs the namespace tree from a slice of serialized nodes.
-// It locks the root node for thread safety and updates it with the deserialized tree.
 func (nm *NamespaceManager) Deserialize(nodes []SerializedNsTreeNode) *NsTree {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
@@ -168,7 +136,6 @@ func (nm *NamespaceManager) Deserialize(nodes []SerializedNsTreeNode) *NsTree {
 }
 
 // Serialize converts the namespace tree into a slice of SerializedNsTreeNode for persistence.
-// It locks the root node for thread safety and builds the serialized representation.
 func (nm *NamespaceManager) Serialize() []SerializedNsTreeNode {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
@@ -183,7 +150,6 @@ func (nm *NamespaceManager) Serialize() []SerializedNsTreeNode {
 }
 
 // nsTreeToSlice recursively converts an NsTree node into a SerializedNsTreeNode and appends it to the result slice.
-// It returns the index of the node in the serialized slice.
 func (nm *NamespaceManager) nsTreeToSlice(r *[]SerializedNsTreeNode, node *NsTree) int {
 	n := SerializedNsTreeNode{
 		IsDir:  node.IsDir,
@@ -193,7 +159,6 @@ func (nm *NamespaceManager) nsTreeToSlice(r *[]SerializedNsTreeNode, node *NsTre
 	if n.IsDir {
 		n.Children = make(map[string]int)
 		for k, child := range node.childrenNodes {
-			// use the idx to store the location in the list
 			n.Children[k] = nm.nsTreeToSlice(r, child)
 		}
 	}
@@ -203,59 +168,70 @@ func (nm *NamespaceManager) nsTreeToSlice(r *[]SerializedNsTreeNode, node *NsTre
 	return ret
 }
 
-// lockParents acquires locks on the parent nodes of the given path.
-// If lock is true, it acquires a write lock on the immediate parent; otherwise, it uses read locks.
-func (nm *NamespaceManager) lockParents(p common.Path, lock bool) ([]string, *NsTree, error) {
+// lockParents acquires locks on the ancestor nodes up to (and including) the parent directory of the given path.
+func (nm *NamespaceManager) lockParents(p common.Path, lock bool) ([]*NsTree, *NsTree, error) {
+	log.Printf("path: >>> %s", p)
+	locked := []*NsTree{}
+	current := nm.root
+	nm.root.RLock()
+	locked = append(locked, nm.root)
+
+	if string(p) == "" || string(p) == "/" {
+		if lock {
+			nm.root.RUnlock()
+			nm.root.Lock()
+		}
+		return locked, nm.root, nil
+	}
+
 	pf := strings.Split(string(p), "/")
-	return lockParentHelper(nm.root, pf, lock)
-}
-
-// lockParentHelper is a helper function to traverse and lock parent nodes in the namespace tree.
-// It returns the list of parent node names, the target node, and any error encountered.
-func lockParentHelper(cwd *NsTree, pf []string, lock bool) ([]string, *NsTree, error) {
-	var parents []string
-	for i := 1; i < len(pf); i++ {
-		if cwd == nil {
-			return parents, nil, fmt.Errorf("path %s is not found", strings.Join(pf, "/"))
+	parts := []string{}
+	for _, part := range pf {
+		if part != "" {
+			parts = append(parts, part)
 		}
-		if lock && i == len(parents)-1 {
-			cwd.Lock()
-			parents = append(parents, pf[i-1])
-			cwd = cwd.childrenNodes[pf[i]]
-			if cwd != nil {
-				cwd.RLock()
+	}
+
+	for i, name := range parts {
+		child, ok := current.childrenNodes[name]
+		if !ok {
+			for j := len(locked) - 1; j >= 0; j-- {
+				locked[j].RUnlock()
 			}
-			return parents, cwd, nil
+			return nil, nil, fmt.Errorf("path %s is not found", p)
 		}
-		cwd.RLock()
-		parents = append(parents, pf[i-1])
-		cwd = cwd.childrenNodes[pf[i]]
+
+		current.RUnlock()
+		locked = locked[:len(locked)-1]
+
+		isLast := (i == len(parts)-1)
+		if isLast && lock {
+			child.Lock()
+		} else {
+			child.RLock()
+		}
+		locked = append(locked, child)
+		current = child
 	}
-	if cwd == nil {
-		return parents, nil, fmt.Errorf("path %s is not found", strings.Join(pf, "/"))
-	}
-	cwd.RLock()
-	return parents, cwd, nil
+	return locked, current, nil
 }
 
-// unlockParents releases locks on the parent nodes in the namespace tree.
-// If lock is true, it releases the write lock on the immediate parent; otherwise, it releases read locks.
-func (nm *NamespaceManager) unlockParents(parents []string, lock bool) {
-	cwd := nm.root
-	for i, parent := range parents {
-		cwd = cwd.childrenNodes[parent]
-		if cwd == nil {
-			return
+// unlockParents releases the locks on the provided list of locked nodes in reverse order.
+func (nm *NamespaceManager) unlockParents(locked []*NsTree, lock bool) {
+	if len(locked) == 0 {
+		return
+	}
+	lastIndex := len(locked) - 1
+	for i := lastIndex; i >= 0; i-- {
+		if i == lastIndex && lock {
+			locked[i].Unlock()
+		} else {
+			locked[i].RUnlock()
 		}
-		if lock && i == len(parents)-1 {
-			cwd.Unlock()
-		}
-		cwd.RUnlock()
 	}
 }
 
 // Create adds a new file node to the namespace at the specified path.
-// It validates the filename and ensures the path does not already exist
 func (nm *NamespaceManager) Create(p common.Path) error {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
@@ -265,13 +241,13 @@ func (nm *NamespaceManager) Create(p common.Path) error {
 		dirpath  string
 	)
 	dirpath, filename = nm.RetrievePartitionFromPath(p)
-	_, err := utils.ValidateFilenameStr(filename, p)
+	err := utils.ValidateFilename(filename, p)
 	if err != nil {
 		return err
 	}
 
-	pf, cwd, err := nm.lockParents(common.Path(dirpath), true)
-	defer nm.unlockParents(pf, true) // to ensure unlocking of read locks
+	parents, cwd, err := nm.lockParents(common.Path(dirpath), true)
+	defer nm.unlockParents(parents, true)
 	if err != nil {
 		return err
 	}
@@ -280,24 +256,23 @@ func (nm *NamespaceManager) Create(p common.Path) error {
 		return nil
 	}
 
-	cwd.childrenNodes[filename] = &NsTree{Path: p}
+	cwd.childrenNodes[filename] = &NsTree{Path: p, IsDir: false}
 	return nil
 }
 
 // Delete marks a file or directory at the specified path as deleted by prefixing its name.
-// The actual removal is handled by the periodic cleanup goroutine.
 func (nm *NamespaceManager) Delete(p common.Path) error {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
 	dirpath, filename := nm.RetrievePartitionFromPath(p)
-	_, err := utils.ValidateFilenameStr(filename, p)
+	err := utils.ValidateFilename(filename, p)
 	if err != nil {
 		return err
 	}
 
-	pf, cwd, err := nm.lockParents(common.Path(dirpath), true)
-	defer nm.unlockParents(pf, true) // to ensure unlocking of read locks
+	parents, cwd, err := nm.lockParents(common.Path(dirpath), true)
+	defer nm.unlockParents(parents, true)
 	if err != nil {
 		return err
 	}
@@ -306,10 +281,6 @@ func (nm *NamespaceManager) Delete(p common.Path) error {
 		return fmt.Errorf("path does not %s exist", p)
 	}
 
-	//??
-	//namespace is only deleted via go routine after the chunk servers has successfully
-	// deleted all associated chunks [ NOPE - I found a workaround check the master removes the file chunk
-	//  from the available in-memory map ]
 	node := cwd.childrenNodes[filename]
 	deletedNodeKey := fmt.Sprintf("%s%s", common.DeletedNamespaceFilePrefix, filename)
 	node.Path = common.Path(deletedNodeKey)
@@ -326,7 +297,6 @@ func (nm *NamespaceManager) MkDir(p common.Path) error {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
-	// each nodetree is a directory
 	var (
 		dirpath string
 		dirname string
@@ -350,27 +320,51 @@ func (nm *NamespaceManager) MkDir(p common.Path) error {
 }
 
 // MkDirAll creates all necessary parent directories for the specified path, similar to `mkdir -p`.
-// It ensures the entire path exists by creating directories as needed.
+// It ensures the entire path exists by creating directories as needed, but skips the final segment
+// if it resembles a file (has a common extension) to prevent misclassifying files as directories.
+// If the full path resembles a file, it creates directories only up to the parent.
+// MkDirAll creates all necessary parent directories for the specified path, similar to `mkdir -p`.
+// It ensures the entire path exists by creating directories as needed, but skips the final segment
+// if it resembles a file (has a common extension) to prevent misclassifying files as directories.
+// If the full path resembles a file, it creates directories only up to the parent.
+// This implementation is iterative to avoid recursion depth issues.
 func (nm *NamespaceManager) MkDirAll(p common.Path) error {
-	// I don't give a fuck whether it is not optimized lol
-	fragments := []string{}
-	sfrags := strings.Split(string(p), "/")
-	fragments = append(fragments, sfrags[1:]...)
-	currPath := "/"
-	for idx, fragment := range fragments {
-		if idx > 0 {
-			currPath += "/"
+	if string(p) == "" || string(p) == "/" {
+		return nil
+	}
+
+	fullPath := string(p)
+	log.Printf("fullPath:%s", fullPath)
+	dirPath, lastSegment := nm.RetrievePartitionFromPath(p)
+	targetPathStr := fullPath
+	if filepath.Ext(lastSegment) != "" {
+		if dirPath == "" {
+			return nil
 		}
-		currPath += fragment
-		_, err := nm.Get(common.Path(currPath))
-		if err == nil {
+		targetPathStr = dirPath
+	}
+	segments := strings.Split(targetPathStr, "/")
+	currentPath := "/"
+	for _, seg := range segments {
+		if seg == "" {
 			continue
 		}
-		err = nm.MkDir(common.Path(currPath))
-		if err != nil {
+		nextPath := filepath.Join(currentPath, seg)
+		currP := common.Path(nextPath)
+
+		// if _, err := nm.Get(currP); err == nil {
+		// 	currentPath = nextPath
+		// 	continue
+		// }
+
+		if err := nm.MkDir(currP); err != nil {
 			return err
 		}
+		currentPath = nextPath
 	}
+
+	log.Printf("currentPath:%s", currentPath)
+	log.Printf("Path:%s ?>", targetPathStr)
 	return nil
 }
 
@@ -383,145 +377,138 @@ func (nm *NamespaceManager) Get(p common.Path) (*NsTree, error) {
 	parents, cwd, err := nm.lockParents(common.Path(dirpath), false)
 	defer nm.unlockParents(parents, false)
 	if err != nil {
+		log.Println("SHITT")
 		return nil, err
 	}
 	if dir, ok := cwd.childrenNodes[filenameOrDirname]; ok {
+		log.Println("NICE")
 		return dir, nil
 	}
 	return nil, fmt.Errorf("node with path %s does not exist for %s", dirpath, filenameOrDirname)
 }
 
 // Rename moves a file or directory from the source path to the target path.
-// It updates the node's path and ensures the source exists and the target does not.
-// func (nm *NamespaceManager) Rename(source, target common.Path) error {
-// 	nm.mu.Lock()
-// 	defer nm.mu.Unlock()
-
-// 	var (
-// 		srcDirnameOrFilename    string
-// 		srcDirpath              string
-// 		targetDirnameOrFilename string
-// 		targetDirpath           string
-// 	)
-// 	srcDirpath, srcDirnameOrFilename = nm.RetrievePartitionFromPath(source)
-// 	parents, cwd, err := nm.lockParents(common.Path(srcDirpath), true)
-// 	defer nm.unlockParents(parents, true)
-
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	if _, ok := cwd.childrenNodes[srcDirnameOrFilename]; !ok {
-// 		return fmt.Errorf("filename/dirname %s does not seem exist", srcDirnameOrFilename)
-// 	}
-
-// 	targetDirpath, targetDirnameOrFilename = nm.RetrievePartitionFromPath(target)
-// 	_ = targetDirnameOrFilename
-
-// 	node := cwd.childrenNodes[srcDirnameOrFilename]
-// 	node.Lock()
-// 	defer node.Unlock()
-// 	if node.IsDir {
-// 		err = nm.MkDir(common.Path(targetDirpath))
-// 		if err != nil {
-// 			return err
-// 		}
-// 	} else {
-// 		err = nm.Create(common.Path(target))
-// 		if err != nil {
-// 			return err
-// 		}
-// 	}
-
-// 	newNode, err := nm.Get(target)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	newNode.Path = target
-// 	newNode.IsDir = node.IsDir
-// 	newNode.Length = node.Length
-// 	newNode.Chunks = node.Chunks
-// 	maps.Copy(newNode.childrenNodes, node.childrenNodes)
-
-// 	return nm.Delete(common.Path(source))
-// }
-
 func (nm *NamespaceManager) Rename(source, target common.Path) error {
+	nm.mu.Lock()
 	if source == target {
 		return nil
 	}
-	if _, err := utils.ValidateFilenameStr(string(source), source); err != nil {
-		return fmt.Errorf("invalid source path: %v", err)
-	}
-	if _, err := utils.ValidateFilenameStr(string(target), target); err != nil {
-		return fmt.Errorf("invalid target path: %v", err)
-	}
-
-	srcDirpath, srcFilenameOrDirname := nm.RetrievePartitionFromPath(source)
-	targetDirpath, targetFilenameOrDirname := nm.RetrievePartitionFromPath(target)
-
-	nm.mu.Lock()
-	srcParents, srcParent, err := nm.lockParents(common.Path(srcDirpath), true)
+	err := errors.Join(
+		utils.ValidateFilename(string(source), source),
+		utils.ValidateFilename(string(target), target))
 	if err != nil {
 		nm.mu.Unlock()
-		nm.unlockParents(srcParents, true)
-		return err
+		return fmt.Errorf("invalid path: %v", err)
 	}
+
+	srcDirpath, srcName := nm.RetrievePartitionFromPath(source)
+	tgtDirpath, tgtName := nm.RetrievePartitionFromPath(target)
 	nm.mu.Unlock()
 
-	defer nm.unlockParents(srcParents, true)
+	if _, err := nm.Get(common.Path(source)); err != nil {
+		return fmt.Errorf("failed to locate source directory: %v", err)
+	}
 
-	srcNode, ok := srcParent.childrenNodes[srcFilenameOrDirname]
+	if tgtDirpath != "" {
+		if err := nm.MkDirAll(common.Path(tgtDirpath)); err != nil {
+			return fmt.Errorf("failed to create target directory: %v", err)
+		}
+	}
+
+	log.Println("==================++YESS=====")
+
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	if srcDirpath == tgtDirpath {
+		// Same parent directory - only need to lock once
+		parents, parent, err := nm.lockParents(common.Path(srcDirpath), true)
+		if err != nil {
+			return err
+		}
+		defer nm.unlockParents(parents, true)
+
+		srcNode, ok := parent.childrenNodes[srcName]
+		if !ok {
+			return fmt.Errorf("source path %s does not exist", source)
+		}
+
+		if _, exists := parent.childrenNodes[tgtName]; exists {
+			return fmt.Errorf("target path %s already exists", target)
+		}
+
+		delete(parent.childrenNodes, srcName)
+		srcNode.Path = target
+		parent.childrenNodes[tgtName] = srcNode
+
+		return nil
+	}
+
+	lockSrcFirst := srcDirpath < tgtDirpath
+
+	var srcParentsLocked, tgtParentsLocked []*NsTree
+	var srcParentNode, tgtParentNode *NsTree
+
+	if lockSrcFirst {
+		srcParentsLocked, srcParentNode, err = nm.lockParents(common.Path(srcDirpath), true)
+		if err != nil {
+			return err
+		}
+		defer nm.unlockParents(srcParentsLocked, true)
+
+		tgtParentsLocked, tgtParentNode, err = nm.lockParents(common.Path(tgtDirpath), true)
+		if err != nil {
+			return err
+		}
+		defer nm.unlockParents(tgtParentsLocked, true)
+	} else {
+		tgtParentsLocked, tgtParentNode, err = nm.lockParents(common.Path(tgtDirpath), true)
+		if err != nil {
+			return err
+		}
+		defer nm.unlockParents(tgtParentsLocked, true)
+
+		srcParentsLocked, srcParentNode, err = nm.lockParents(common.Path(srcDirpath), true)
+		if err != nil {
+			return err
+		}
+		defer nm.unlockParents(srcParentsLocked, true)
+	}
+
+	if _, ok := tgtParentNode.childrenNodes[tgtName]; ok {
+		return fmt.Errorf("target path %s already exists", target)
+	}
+
+	srcNode, ok := srcParentNode.childrenNodes[srcName]
 	if !ok {
 		return fmt.Errorf("source path %s does not exist", source)
 	}
 
-	err = nm.MkDirAll(common.Path(targetDirpath))
-	if err != nil {
-		nm.unlockParents(srcParents, true)
-		return fmt.Errorf("failed to create target directory: %v", err)
-	}
-
-	targetParents, targetParent, err := nm.lockParents(common.Path(targetDirpath), true)
-	if err != nil {
-		nm.unlockParents(targetParents, true)
-		return err
-	}
-	defer nm.unlockParents(targetParents, true)
-
-	if _, ok := targetParent.childrenNodes[targetFilenameOrDirname]; ok {
-		return fmt.Errorf("target path %s already exists", target)
-	}
-
-	srcNode.Lock()
-	defer srcNode.Unlock()
+	delete(srcParentNode.childrenNodes, srcName)
 	srcNode.Path = target
-	targetParent.childrenNodes[targetFilenameOrDirname] = srcNode
-	delete(srcParent.childrenNodes, srcFilenameOrDirname)
-
-	nm.mu.Lock()
-	nm.deleteCache[string(source)] = struct{}{}
-	nm.mu.Unlock()
+	tgtParentNode.childrenNodes[tgtName] = srcNode
 
 	return nil
 }
 
 // List returns a list of PathInfo for all nodes under the specified path.
-// It traverses the directory tree and includes both files and directories.
 func (nm *NamespaceManager) List(p common.Path) ([]common.PathInfo, error) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
 	var dir *NsTree
+	var parents []*NsTree
 	if p == common.Path("/") {
-		dir = nm.root
+		_, dir = []*NsTree{nm.root}, nm.root
+		dir.RLock()
+		defer dir.RUnlock()
 	} else {
-		parents, cwd, err := nm.lockParents(p, false)
+		var err error
+		parents, dir, err = nm.lockParents(p, false)
 		defer nm.unlockParents(parents, false)
 		if err != nil {
 			return nil, err
 		}
-		dir = cwd
 	}
 
 	info := []common.PathInfo{}
@@ -548,8 +535,5 @@ func (nm *NamespaceManager) List(p common.Path) ([]common.PathInfo, error) {
 
 // RetrievePartitionFromPath splits a path into its directory path and filename or directory name.
 func (nm *NamespaceManager) RetrievePartitionFromPath(p common.Path) (string, string) {
-	ps := string(p)
-	pf := strings.Split(ps, "/")
-	pf1, pf2 := pf[:len(pf)-1], pf[len(pf)-1]
-	return strings.Join(pf1, "/"), pf2
+	return filepath.Dir(string(p)), filepath.Base(string(p))
 }
