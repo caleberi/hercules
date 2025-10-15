@@ -41,9 +41,8 @@ func populateServers(t *testing.T, client *HerculesClient) []common.ChunkHandle 
 	fake := faker.New()
 
 	for range 3 {
-		fakePath := fmt.Sprintf("/%s/%s/file-%d",
-			fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000))
-
+		fakePath := common.Path(fmt.Sprintf(
+			"/%s/file-%d.%s", fake.Music().Genre(), rand.Intn(1000), fake.File().FilenameWithExtension()))
 		handle, err := client.GetChunkHandle(common.Path(fakePath), 0)
 		require.NoError(t, err)
 
@@ -93,9 +92,8 @@ func TestHerculesClientIntegration(t *testing.T) {
 			name: "WriteAndRead",
 			doTest: func(t *testing.T) {
 				fake := faker.New()
-				path := common.Path(fmt.Sprintf(
-					"/%s/%s/file-%d", fake.Music().Genre(),
-					fake.Music().Author(), rand.Intn(1000)))
+				path := common.Path(fmt.Sprintf("/%s/%s/%s",
+					fake.Music().Genre(), fake.Music().Author(), fake.File().FilenameWithExtension()))
 				data := []byte(fake.Lorem().Sentence(10))
 
 				handle, err := client.GetChunkHandle(common.Path(path), 0)
@@ -116,8 +114,8 @@ func TestHerculesClientIntegration(t *testing.T) {
 			name: "AppendAndRead",
 			doTest: func(t *testing.T) {
 				fake := faker.New()
-				path := common.Path(fmt.Sprintf("/%s/%s/file-%d",
-					fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000)))
+				path := common.Path(fmt.Sprintf("/%s/%s/%s",
+					fake.Music().Genre(), fake.Music().Author(), fake.File().FilenameWithExtension()))
 				data := []byte(fake.Lorem().Sentence(5))
 
 				handle, err := client.GetChunkHandle(common.Path(path), 0)
@@ -143,8 +141,9 @@ func TestHerculesClientIntegration(t *testing.T) {
 			doTest: func(t *testing.T) {
 				fake := faker.New()
 				dirPath := common.Path(fmt.Sprintf(
-					"/%s/%s", fake.Music().Genre(), fake.Music().Author()))
-				filePath := common.Path(fmt.Sprintf("%s/file-%d", dirPath, rand.Intn(1000)))
+					"/%s/file-%d.%s", fake.Music().Genre(), rand.Intn(1000), fake.File().FilenameWithExtension()))
+				filePath := common.Path(fmt.Sprintf(
+					"/%s/file-%d.%s", fake.Music().Genre(), rand.Intn(1000), fake.File().FilenameWithExtension()))
 
 				handle, err := client.GetChunkHandle(common.Path(filePath), 0)
 				require.NoError(t, err)
@@ -154,7 +153,7 @@ func TestHerculesClientIntegration(t *testing.T) {
 				assert.NoError(t, err)
 				assert.GreaterOrEqual(t, len(entries), 1)
 
-				err = client.DeleteFile(filePath)
+				err = client.DeleteFile(filePath, true)
 				assert.NoError(t, err)
 
 				entries, err = client.List(dirPath)
@@ -167,9 +166,9 @@ func TestHerculesClientIntegration(t *testing.T) {
 			doTest: func(t *testing.T) {
 				fake := faker.New()
 				path := common.Path(fmt.Sprintf(
-					"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
+					"/%s/file-%d.%s", fake.Music().Genre(), rand.Intn(1000), fake.File().FilenameWithExtension()))
 				newPath := common.Path(fmt.Sprintf(
-					"/%s/%s/file-%d", fake.Music().Genre(), fake.File().FilenameWithExtension(), rand.Intn(1000)))
+					"/%s/file-%d.%s", fake.Music().Genre(), rand.Intn(1000), fake.File().FilenameWithExtension()))
 
 				handle, err := client.GetChunkHandle(common.Path(path), 0)
 				require.NoError(t, err)
@@ -198,9 +197,8 @@ func TestHerculesClientIntegration(t *testing.T) {
 			name: "LeaseManagement",
 			doTest: func(t *testing.T) {
 				fake := faker.New()
-				path := common.Path(fmt.Sprintf(
-					"/%s/%s/file-%d", fake.Music().Genre(), fake.Music().Author(), rand.Intn(1000)))
-
+				path := common.Path(fmt.Sprintf("/%s/%s/%s",
+					fake.Music().Genre(), fake.Music().Author(), fake.File().FilenameWithExtension()))
 				handle, err := client.GetChunkHandle(path, 0)
 				assert.NoError(t, err)
 				lease, _, err := client.ObtainLease(handle, 0)
@@ -217,7 +215,6 @@ func TestHerculesClientIntegration(t *testing.T) {
 		},
 	}
 
-	// Run test cases
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.doTest(t)

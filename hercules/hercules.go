@@ -232,11 +232,11 @@ func (hercules *HerculesClient) List(path common.Path) ([]common.PathInfo, error
 //
 // Returns:
 //   - An error if the RPC call fails.
-func (hercules *HerculesClient) DeleteFile(path common.Path) error {
+func (hercules *HerculesClient) DeleteFile(path common.Path, deleteHandle bool) error {
 	reply := &rpc_struct.DeleteFileReply{}
 	return shared.UnicastToRPCServer(
 		string(hercules.master), rpc_struct.MRPCDeleteFileHandler,
-		rpc_struct.DeleteFileArgs{Path: path}, reply)
+		rpc_struct.DeleteFileArgs{Path: path, DeleteHandle: deleteHandle}, reply)
 }
 
 // RenameFile renames a file from the source path to the target path.
